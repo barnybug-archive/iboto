@@ -19,9 +19,12 @@ banner = """iboto ready
 
 Commands available:
 %ec2ssh
-%ec2run
-%ec2start
-%ec2stop
+%ec2run   (aka %ec2-run-instances)
+%ec2start (aka %ec2-start-instances)
+%ec2stop  (aka %ec2-stop-instances)
+%ec2kill  (aka %ec2-terminate-instances)
+%ec2din   (aka %ec2-describe-instances)
+%ec2watch
 %region
 
 '%command?' for more information.

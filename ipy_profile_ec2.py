@@ -5,10 +5,11 @@ import IPython.ipapi
 from IPython.ipstruct import Struct
 import boto.ec2
 import config
+import socket
 
 # TODO better exception handling in completers
 # TODO handle spaces in tags (completion)
-# TODO ssh connection available
+# TODO autogenerate ec2run docstring
 
 ip = IPython.ipapi.get()
 region = getattr(config, 'DEFAULT_REGION', 'us-east-1')
@@ -67,8 +68,12 @@ def build_ami_list():
     return ami
 ami = build_ami_list()
 
-def expose_magic(fn):
-    ip.expose_magic(fn.__name__, fn)
+def expose_magic(*args):
+    def _d(fn):
+        for arg in args:
+            ip.expose_magic(arg, fn)
+        return fn
+    return _d
 
 ######################################################
 # magic ec2run
@@ -108,13 +113,13 @@ ec2run_parameters = []
 for o in ec2run_parser.option_list:
     ec2run_parameters.extend(o._short_opts + o._long_opts)
 
-@expose_magic
+@expose_magic('ec2run', 'ec2-run-instances')
 def ec2run(self, parameter_s):
     """Launch a number of instances of the specified AMI.
 
     Usage:\\
       %ec2run [options] AMI
-      These options from the Amazon command line tool are supporting:
+      These options from the Amazon command line tool are supported:
       -k, --key KEYPAIR
       
     """
@@ -170,7 +175,7 @@ def ec2run(self, parameter_s):
     run_args['image_id'] = resolve_ami(args[0])
     r = ec2.run_instances(**run_args)
     
-    inst = firstinstance(r)
+    inst = firstinstance([r])
     return str(inst.id)
 
 def ec2run_completers(self, event):
@@ -178,11 +183,6 @@ def ec2run_completers(self, event):
     if event.line.endswith(' '):
         cmd_param.append('')
     arg = cmd_param.pop()
-    #if arg.startswith('-'):
-    #    ret = []
-    #    for o in ec2run_parser.option_list:
-    #        ret.extend(o._short_opts + o._long_opts)
-    #    return ret
     
     arg = cmd_param.pop()
     if arg in ('-t', '--instance-type'):
@@ -222,23 +222,28 @@ def ec2run_completers(self, event):
         return params + ami.keys()
 
 ip.set_hook('complete_command', ec2run_completers, re_key = '%?ec2run')
+ip.set_hook('complete_command', ec2run_completers, re_key = '%?ec2-run-instances')
 
 re_inst_id = re.compile(r'i-\w+')
 re_tag = re.compile(r'(\w+):(.+)')
-def resolve_instances(arg):
+def resolve_instances(arg, filters=None):
     inst = None
     if arg == 'latest':
-        r = ec2.get_all_instances(filters={'instance-state-name':'running'})
+        r = ec2.get_all_instances(filters=filters)
         li = sorted(list_instances(r), key=lambda i:i.launch_time)
         if li:
-            return li[-1]
+            return li[-1:]
         else:
             return []
 
     m = re_inst_id.match(arg)
     if m:
-        r = ec2.get_all_instances(instance_ids=[arg])
-        return list_instances(r)
+        if len(arg) == 10:
+            r = ec2.get_all_instances(instance_ids=[arg])
+            return list_instances(r)
+        else:
+            # partial id
+            return [ i for i in iter_instances(ec2.get_all_instances()) if i.id.startswith(arg) ]
 
     m = re_tag.match(arg)
     if m:
@@ -247,12 +252,32 @@ def resolve_instances(arg):
 
     return []
 
-def resolve_instance(arg):
-    insts = resolve_instances(arg)
+def resolve_instance(arg, filters=None):
+    insts = resolve_instances(arg, filters)
     if insts:
         return insts[0]
     else:
         return None
+
+def args_instances(args, default='error'):
+    instances = []
+    if args:
+        # ensure all instances are found before we start them
+        for qs in args:
+            insts = resolve_instances(qs)
+            if not insts:
+                print 'Instance not found for %s' % qs
+                return
+            instances.extend(insts)
+    elif default=='all':
+        instances = list_instances(ec2.get_all_instances())
+    else:
+        raise IPython.ipapi.UsageError, 'Command needs an instance specifying'
+
+    if not instances:
+        raise IPython.ipapi.UsageError, 'No instances found'
+
+    return instances
 
 ######################################################
 # magic ec2ssh
@@ -260,7 +285,16 @@ def resolve_instance(arg):
 
 re_user = re.compile('^(\w+@)')
 
-@expose_magic
+def ssh_live(ip, port=22):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.connect((ip, port))
+        s.shutdown(2)
+        return True
+    except:
+        return False
+
+@expose_magic('ec2ssh')
 def ec2ssh(self, parameter_s):
     """SSH to a running instance.
 
@@ -302,6 +336,11 @@ def ec2ssh(self, parameter_s):
         print 'Waiting for %s pending->running...' % inst.id
         while inst.update() == 'pending':
             time.sleep(1)
+
+    if not ssh_live(inst.ip_address):
+        print 'Waiting for %s SSH port...' % inst.id
+        while not ssh_live(inst.ip_address):
+            time.sleep(1)
             
     if inst.state == 'running':
         print 'Connecting to %s...' % inst.public_dns_name
@@ -315,9 +354,9 @@ def instance_completer_factory(filters):
     def _completer(self, event):
         try:
             instances = []
-            running = list_instances(ec2.get_all_instances(filters=filters))
-            instances.extend([i.id for i in running])
-            for i in running:
+            r = list_instances(ec2.get_all_instances(filters=filters))
+            instances.extend([i.id for i in r])
+            for i in r:
                 for k, v in i.tags.iteritems():
                     instances.append('%s:%s' % (k, v))
         
@@ -331,93 +370,139 @@ ip.set_hook('complete_command',
             re_key = '%?ec2ssh')
 
 ######################################################
-# magic ec2start
+# generic methods for ec2start, ec2stop, ec2kill
 ######################################################
 
-@expose_magic
-def ec2start(self, parameter_s):
-    """Start selected stopped instances.
-
+def _define_ec2cmd(cmd, verb, method, state):
+    filters = {'instance-state-name': state}
+    
+    def _ec2cmd(self, parameter_s):
+        args = parameter_s.split()
+        instances = args_instances(args)
+        
+        fn = getattr(ec2, method)
+        fn([inst.id for inst in instances])
+        return ' '.join( str(inst.id) for inst in instances )
+    
+    # create function with docstring
+    fn = (lambda a,b: _ec2cmd(a,b))
+    fn.__doc__ = """%(uverb)s selected %(state)s instances.
+        
     Usage:\\
-      %ec2start i-xxxxxxx|Tag:Value|latest
+      %%%(cmd)s i-xxxxxxx|Tag:Value|latest
       
-    The last parameter selects the instance(s) to start. The instance may be specified
+    The last parameter selects the instance(s) to %(verb)s. The instance may be specified
     a number of ways:
     - i-xxxxxx: specify an instance by instance id
     - Tag:Value: specify an instance by Tag (e.g. Name:myname)
     - latest: the last launched instance
 
-    Note: tab-completion is available, and completes on currently running instances, so
+    Note: tab-completion is available, and completes on appropriate instances, so
     you can for example do:
-      %ec2start i-1<TAB>     - tab complete of instances with a instance id starting i-1.
-      %ec2start Name:<TAB>   - tab complete of instances with a tag 'Name'.
+      %%%(cmd)s i-1<TAB>     - tab complete of instances with a instance id starting i-1.
+      %%%(cmd)s Name:<TAB>   - tab complete of instances with a tag 'Name'.
+      """ % dict(verb=verb, cmd=cmd, uverb=verb.capitalize(), state=state)
+    ip.expose_magic(cmd, fn)
 
-    This command returns the instances ids started, which for example you can then pass to ec2ssh:
-    %ec2ssh $_
-    """
-    
-    args = parameter_s.split()
-    if not args:
-        raise IPython.ipapi.UsageError, '%ec2start needs an instance specifying'
+    ip.set_hook('complete_command',
+                instance_completer_factory(filters=filters),
+                re_key = '%?'+cmd)
 
-    # ensure all instances are found before we start them
-    instances = []
-    for qs in args:
-        insts = resolve_instances(qs)
-        if not insts:
-            print 'Instance not found for %s' % qs
-            return
-        instances.extend(insts)
-        
-    ec2.start_instances([inst.id for inst in instances])
-    return ' '.join( str(inst.id) for inst in instances )
+######################################################
+# magic ec2start
+######################################################
 
-ip.set_hook('complete_command',
-            instance_completer_factory(filters={'instance-state-name': 'stopped'}),
-            re_key = '%?ec2start')
+_define_ec2cmd('ec2start', 'start', 'start_instances', 'stopped')
+_define_ec2cmd('ec2-start-instances', 'start', 'start_instances', 'stopped')
 
 ######################################################
 # magic ec2stop
 ######################################################
 
-@expose_magic
-def ec2stop(self, parameter_s):
-    """Stop selected running instances.
+_define_ec2cmd('ec2stop', 'stop', 'stop_instances', 'running')
+_define_ec2cmd('ec2-stop-instances', 'stop', 'stop_instances', 'running')
+
+######################################################
+# magic ec2kill
+######################################################
+
+_define_ec2cmd('ec2kill', 'terminate', 'terminate_instances', 'running')
+_define_ec2cmd('ec2-terminate-instances', 'terminate', 'terminate_instances', 'running')
+
+######################################################
+# magic ec2din
+######################################################
+
+@expose_magic('ec2din', 'ec2-describe-instances')
+def ec2din(self, parameter_s):
+    """List and describe your instances.
 
     Usage:\\
-      %ec2stop i-xxxxxxx|Tag:Value|latest
-      
-    The last parameter selects the instance(s) to stop. The instance may be specified
-    a number of ways:
-    - i-xxxxxx: specify an instance by instance id
-    - Tag:Value: specify an instance by Tag (e.g. Name:myname)
-    - latest: the last launched instance
-
-    Note: tab-completion is available, and completes on currently running instances, so
-    you can for example do:
-      %ec2stop i-1<TAB>     - tab complete of instances with a instance id stoping i-1.
-      %ec2stop Name:<TAB>   - tab complete of instances with a tag 'Name'.
+      %ec2din [instance ...]
     """
-    
     args = parameter_s.split()
-    if not args:
-        raise IPython.ipapi.UsageError, '%ec2stop needs an instance specifying'
+    instances = args_instances(args, default='all')
+    print '%-11s %-8s %-9s %-11s %-13s %-25s' % ('instance', 'state', 'type', 'zone', 'ami', 'launch time')
+    print '='*80
+    for i in instances:
+        print '%-11s %-8s %-9s %-11s %-13s %-25s' % (i.id, i.state[0:8], i.instance_type, i.placement, i.image_id, i.launch_time)
 
-    # ensure all instances are found before we stop them
-    instances = []
-    for qs in args:
-        insts = resolve_instances(qs)
-        if not insts:
-            print 'Instance not found for %s' % qs
-            return
-        instances.extend(insts)
-        
-    ec2.stop_instances([inst.id for inst in instances])
-    return ' '.join( str(inst.id) for inst in instances )
+######################################################
+# magic ec2watch
+######################################################
 
-ip.set_hook('complete_command',
-            instance_completer_factory(filters={'instance-state-name': 'running'}),
-            re_key = '%?ec2stop')
+def _watch_step(args, instances, monitor_fields):
+    new_instances = args_instances(args, default='all')
+    n_i = new_instances[:]
+    id_i = [ i.id for i in n_i ]
+    for inst in instances:
+        if inst.id in id_i:
+            n = id_i.index(inst.id)
+                
+            # compare properties
+            changes = []
+            for k in monitor_fields:
+                v1 = getattr(inst, k)
+                v2 = getattr(n_i[n], k)
+                if v1 != v2:
+                    if v1:
+                        if v2:
+                            print ' %s  %s: %s->%s' % (inst.id, k, v1, v2)
+                        else:
+                            print ' %s -%s: %s' % (inst.id, k, v1)
+                    else:
+                        print ' %s +%s: %s' % (inst.id, k, v2)
+
+            del id_i[n]
+            del n_i[n]
+        else:
+            # instance has gone
+            print '-%s' % inst.id
+            
+    # new instances
+    for i in n_i:
+        print '+%s' % inst.id
+
+    return new_instances
+
+@expose_magic('ec2watch')
+def ec2watch(self, parameter_s):
+    """Watch for changes in any properties on instances.
+
+    Usage:\\
+      %ec2watch [instance ...]
+    """
+    interval = 2
+    monitor_fields = ['launch_time', 'instance_type', 'state', 'public_dns_name', 'private_ip_address']
+
+    args = parameter_s.split()
+    instances = args_instances(args, default='all')
+    try:
+        while True:
+            time.sleep(interval)
+            instances = _watch_step(args, instances, monitor_fields)
+    except KeyboardInterrupt:
+        pass
 
 ######################################################
 # magic regions
@@ -425,7 +510,7 @@ ip.set_hook('complete_command',
 
 regions = [ r.name for r in boto.ec2.regions(**creds) ]
 
-@expose_magic
+@expose_magic('region')
 def region(self, parameter_s):
     """Switch the default region.
     
