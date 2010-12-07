@@ -6,6 +6,10 @@ from IPython.ipstruct import Struct
 import boto.ec2
 import config
 
+# TODO better exception handling in completers
+# TODO handle spaces in tags (completion)
+# TODO ssh connection available
+
 ip = IPython.ipapi.get()
 region = getattr(config, 'DEFAULT_REGION', 'us-east-1')
 creds = dict(aws_access_key_id=config.AWS_ACCESS_KEY_ID,
@@ -27,10 +31,13 @@ def to_slug(n):
     n = re_allowed_chars.sub('_', n)
     return n
 
-def iterinstances(reservations):
+def iter_instances(reservations):
     for r in reservations:
         for i in r.instances:
             yield i
+    
+def list_instances(reservations):
+    return list(iter_instances(reservations))
 
 def firstinstance(reservations):
     for r in reservations:
@@ -218,25 +225,34 @@ ip.set_hook('complete_command', ec2run_completers, re_key = '%?ec2run')
 
 re_inst_id = re.compile(r'i-\w+')
 re_tag = re.compile(r'(\w+):(.+)')
-def resolve_instance(arg):
+def resolve_instances(arg):
     inst = None
     if arg == 'latest':
         r = ec2.get_all_instances(filters={'instance-state-name':'running'})
-        li = sorted(iterinstances(r), key=lambda i:i.launch_time)
+        li = sorted(list_instances(r), key=lambda i:i.launch_time)
         if li:
-            inst = li[-1]
-    else:
-        m = re_inst_id.match(arg)
-        if m:
-            r = ec2.get_all_instances(instance_ids=[arg])
-            inst = firstinstance(r)
+            return li[-1]
         else:
-            m = re_tag.match(arg)
-            if m:
-                r = ec2.get_all_instances(filters={'tag:%s' % m.group(1): m.group(2)})
-                inst = firstinstance(r)
+            return []
 
-    return inst
+    m = re_inst_id.match(arg)
+    if m:
+        r = ec2.get_all_instances(instance_ids=[arg])
+        return list_instances(r)
+
+    m = re_tag.match(arg)
+    if m:
+        r = ec2.get_all_instances(filters={'tag:%s' % m.group(1): m.group(2)})
+        return list_instances(r)
+
+    return []
+
+def resolve_instance(arg):
+    insts = resolve_instances(arg)
+    if insts:
+        return insts[0]
+    else:
+        return None
 
 ######################################################
 # magic ec2ssh
@@ -265,7 +281,7 @@ def ec2ssh(self, parameter_s):
       %ec2ssh Name:<TAB>   - tab complete of instances with a tag 'Name'.
     """
     
-    args = parameter_s.split(' ')
+    args = parameter_s.split()
     qs = args.pop()
     ssh_args = ' '.join(args)
     username = ''
@@ -293,18 +309,115 @@ def ec2ssh(self, parameter_s):
     else:
         print 'Failed, instance %s is not running (%s)' % (inst.id, inst.state)
         
-    return inst
+    return str(inst.id)
 
-def ec2ssh_completers(self, event):
-    instances = []
-    running = list(iterinstances(ec2.get_all_instances(filters={'instance-state-name': 'running'})))
-    instances.extend([i.id for i in running])
-    for i in running:
-        for k, v in i.tags.iteritems():
-            instances.append('%s:%s' % (k, v))
+def instance_completer_factory(filters):
+    def _completer(self, event):
+        try:
+            instances = []
+            running = list_instances(ec2.get_all_instances(filters=filters))
+            instances.extend([i.id for i in running])
+            for i in running:
+                for k, v in i.tags.iteritems():
+                    instances.append('%s:%s' % (k, v))
         
-    return instances
-ip.set_hook('complete_command', ec2ssh_completers, re_key = '%?ec2ssh')
+            return instances
+        except Exception, ex:
+            print ex
+    return _completer
+
+ip.set_hook('complete_command',
+            instance_completer_factory(filters={'instance-state-name': 'running'}),
+            re_key = '%?ec2ssh')
+
+######################################################
+# magic ec2start
+######################################################
+
+@expose_magic
+def ec2start(self, parameter_s):
+    """Start selected stopped instances.
+
+    Usage:\\
+      %ec2start i-xxxxxxx|Tag:Value|latest
+      
+    The last parameter selects the instance(s) to start. The instance may be specified
+    a number of ways:
+    - i-xxxxxx: specify an instance by instance id
+    - Tag:Value: specify an instance by Tag (e.g. Name:myname)
+    - latest: the last launched instance
+
+    Note: tab-completion is available, and completes on currently running instances, so
+    you can for example do:
+      %ec2start i-1<TAB>     - tab complete of instances with a instance id starting i-1.
+      %ec2start Name:<TAB>   - tab complete of instances with a tag 'Name'.
+
+    This command returns the instances ids started, which for example you can then pass to ec2ssh:
+    %ec2ssh $_
+    """
+    
+    args = parameter_s.split()
+    if not args:
+        raise IPython.ipapi.UsageError, '%ec2start needs an instance specifying'
+
+    # ensure all instances are found before we start them
+    instances = []
+    for qs in args:
+        insts = resolve_instances(qs)
+        if not insts:
+            print 'Instance not found for %s' % qs
+            return
+        instances.extend(insts)
+        
+    ec2.start_instances([inst.id for inst in instances])
+    return ' '.join( str(inst.id) for inst in instances )
+
+ip.set_hook('complete_command',
+            instance_completer_factory(filters={'instance-state-name': 'stopped'}),
+            re_key = '%?ec2start')
+
+######################################################
+# magic ec2stop
+######################################################
+
+@expose_magic
+def ec2stop(self, parameter_s):
+    """Stop selected running instances.
+
+    Usage:\\
+      %ec2stop i-xxxxxxx|Tag:Value|latest
+      
+    The last parameter selects the instance(s) to stop. The instance may be specified
+    a number of ways:
+    - i-xxxxxx: specify an instance by instance id
+    - Tag:Value: specify an instance by Tag (e.g. Name:myname)
+    - latest: the last launched instance
+
+    Note: tab-completion is available, and completes on currently running instances, so
+    you can for example do:
+      %ec2stop i-1<TAB>     - tab complete of instances with a instance id stoping i-1.
+      %ec2stop Name:<TAB>   - tab complete of instances with a tag 'Name'.
+    """
+    
+    args = parameter_s.split()
+    if not args:
+        raise IPython.ipapi.UsageError, '%ec2stop needs an instance specifying'
+
+    # ensure all instances are found before we stop them
+    instances = []
+    for qs in args:
+        insts = resolve_instances(qs)
+        if not insts:
+            print 'Instance not found for %s' % qs
+            return
+        instances.extend(insts)
+        
+    ec2.stop_instances([inst.id for inst in instances])
+    return ' '.join( str(inst.id) for inst in instances )
+
+ip.set_hook('complete_command',
+            instance_completer_factory(filters={'instance-state-name': 'running'}),
+            re_key = '%?ec2stop')
 
 ######################################################
 # magic regions
@@ -355,5 +468,5 @@ o.prompt_out = r'Out<\#>:'
 
 # remove blank lines between
 o.separate_in = ''
-o.separate_out = '\n'
-o.separate_out2 = ''
+o.separate_out = ''
+o.separate_out2 = '\n'

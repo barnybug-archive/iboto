@@ -1,5 +1,17 @@
 #!/usr/bin/python
 
+import sys
+
+# check boto installed and new enough
+try:
+    import boto
+    if boto.Version < '2.0':
+        print >>sys.stderr, "You need at least boto 2.0b1 installed to run iboto."
+        sys.exit(-1)
+except:
+    print >>sys.stderr, "You need boto installed to run iboto:\neasy_install boto==2.0b3\nor\npip install boto"
+    sys.exit(-1)
+
 from IPython.Shell import IPShellEmbed
 args = ['-p','ec2']
 
@@ -8,6 +20,8 @@ banner = """iboto ready
 Commands available:
 %ec2ssh
 %ec2run
+%ec2start
+%ec2stop
 %region
 
 '%command?' for more information.
