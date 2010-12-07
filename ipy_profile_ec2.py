@@ -1,6 +1,6 @@
 # ipython module
 
-import os, re, optparse, ConfigParser
+import os, re, time, optparse, ConfigParser
 import IPython.ipapi
 from IPython.ipstruct import Struct
 import boto.ec2
