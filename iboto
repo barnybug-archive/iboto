@@ -1,0 +1,19 @@
+#!/usr/bin/python
+
+from IPython.Shell import IPShellEmbed
+args = ['-p','ec2']
+
+banner = """iboto ready
+
+Commands available:
+%ec2ssh
+%ec2run
+%region
+
+'%command?' for more information.
+"""
+
+ipshell = IPShellEmbed(args,
+                       banner = banner,
+                       exit_msg = 'Leaving iboto')
+ipshell()
