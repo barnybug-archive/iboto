@@ -1,18 +1,33 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 import sys
 
 # check boto installed and new enough
 try:
     import boto
-    if boto.Version < '2.0':
-        print >>sys.stderr, "You need at least boto 2.0b1 installed to run iboto."
+    major, minor = boto.Version.split('.', 1)
+    if 'b' in minor:
+        minor, beta = minor.split('b')
+        if beta:
+            beta = int(beta)
+        else:
+            beta = 1
+    else:
+        beta = sys.maxint
+    major = int(major)
+    minor = int(minor)
+    if major < 2 or (major == 2 and minor == 0 and beta < 3):
+        print >>sys.stderr, "You need at least boto 2.0b3 installed to run iboto (found %s)." % boto.Version
         sys.exit(-1)
 except:
-    print >>sys.stderr, "You need boto installed to run iboto:\neasy_install boto==2.0b3\nor\npip install boto"
+    print >>sys.stderr, "You need boto installed to run iboto:\n$ easy_install boto\nor\n$ pip install boto"
     sys.exit(-1)
 
-from IPython.Shell import IPShellEmbed
+try:
+    from IPython.Shell import IPShellEmbed
+except:
+    print >>sys.stderr, "You need ipython installed to run iboto:\n$ easy_install ipython\nor\n$ pip install ipython"
+    sys.exit(-1)
 args = ['-p','ec2']
 
 banner = """iboto ready

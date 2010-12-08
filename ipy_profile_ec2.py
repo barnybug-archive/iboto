@@ -442,10 +442,10 @@ def ec2din(self, parameter_s):
     """
     args = parameter_s.split()
     instances = args_instances(args, default='all')
-    print '%-11s %-8s %-9s %-11s %-13s %-25s' % ('instance', 'state', 'type', 'zone', 'ami', 'launch time')
-    print '='*80
+    print '%-11s %-8s %-9s %-11s %-13s %-25s %s' % ('instance', 'state', 'type', 'zone', 'ami', 'launch time', 'name')
+    print '='*95
     for i in instances:
-        print '%-11s %-8s %-9s %-11s %-13s %-25s' % (i.id, i.state[0:8], i.instance_type, i.placement, i.image_id, i.launch_time)
+        print '%-11s %-8s %-9s %-11s %-13s %-25s %s' % (i.id, i.state[0:8], i.instance_type, i.placement, i.image_id, i.launch_time, i.tags.get('Name',''))
 
 ######################################################
 # magic ec2watch
