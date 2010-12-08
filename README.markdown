@@ -7,32 +7,38 @@ iboto offers an interactive shell with the basic set of ec2 commands from the Am
 command line tools, on steroids!
 
 It adds:
+
 - full tab-completion on arguments:
-  = amis
-  = instance ids
-  = tags
-  = zones
-  = instance types, etc.
+  + amis
+  + instance ids
+  + tags
+  + zones
+  + instance types, etc.
   Saving much fiddly copy-pasting of ids around.
  
 - much snappier
+
   Without having to load all of Java up first before running a command you'll see it's
   much snappier controlling instances compared to the Amazon tools (as great as they are!).
   
 - extra functionality:
-  = ec2ssh - wait for the instance to get running and SSH to appear live before sshing in,
-    all without having to find and copy the public dns name, or even open a new terminal
-    for SSH.
 
-  = ec2watch - closely monitor what is happening to your instances whilst you're waiting.
+  + ec2ssh - waits for the instance to be running and SSH to be
+    available before connecting; all without having to find and copy
+    the public dns name, guess when it's booted fully or even open a
+    new terminal for SSH.
+
+  + ec2watch - closely monitor what is happening to your instances whilst you're waiting.
   
 - all the nice features of ipython
+
   History recall, python integration, session recording, configurability, etc.
 
-It's best illustrated with a demo session:
+It's probably best illustrated with a demo session...
 
 Demo
 ----
+<pre><code>
 ./iboto
 iboto ready
 
@@ -48,11 +54,11 @@ Commands available:
 
 '%command?' for more information.
 
-eu-west-1 <1>:ec2run -t t<TAB>
+eu-west-1 <1>:ec2run -t t[TAB]
 eu-west-1 <1>:ec2run -t t1.micro
-eu-west-1 <1>:ec2run -t t1.micro -k m<TAB>
+eu-west-1 <1>:ec2run -t t1.micro -k m[TAB]
 eu-west-1 <1>:ec2run -t t1.micro -k mykey
-eu-west-1 <1>:ec2run -t t1.micro -k mykey u<TAB>
+eu-west-1 <1>:ec2run -t t1.micro -k mykey u[TAB]
 eu-west-1 <1>:ec2run -t t1.micro -k mykey ubuntu_lucid_
 eu-west-1 <1>:ec2run -t t1.micro -k mykey ubuntu_lucid_32_ebs
        Out<1>:'i-e4310993'
@@ -88,15 +94,19 @@ eu-west-1 <5>:ec2watch i-e43
 ^Ceu-west-1 <6>:^D
 Leaving iboto
 
+</code></pre>
+
 Installation
 ------------
 There is no need to install, but you will need python, the ipython library and the boto library.
 You can install the two libraries with easy_install:
-$ easy_install boto==2.0b3
-$ easy_install ipython
+
+    $ easy_install boto==2.0b3
+    $ easy_install ipython
 
 To configure:
-$ cp config.py.template config.py
+
+    $ cp config.py.template config.py
 
 Then edit config.py.
 
@@ -107,7 +117,8 @@ Help
 ----
 The best documentation is the command documentation accessed by entering '%command?' at the
 shell prompt, e.g.:
-'%ec2start?'
+
+    '%ec2start?'
 
 boto
 ----
