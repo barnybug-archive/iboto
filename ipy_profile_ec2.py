@@ -119,9 +119,73 @@ def ec2run(self, parameter_s):
 
     Usage:\\
       %ec2run [options] AMI
-      These options from the Amazon command line tool are supported:
-      -k, --key KEYPAIR
+      Almost all the options from the Amazon command line tool are supported:
       
+     -d, --user-data DATA
+          Specifies the user data to be made available to the instance(s) in
+          this reservation.
+
+     -f, --user-data-file DATA-FILE
+          Specifies the file containing user data to be made available to the
+          instance(s) in this reservation.
+
+     -g, --group GROUP [--group GROUP...]
+          Specifies the security group (or groups if specified multiple times)
+          within which the instance(s) should be run. Determines the ingress
+          firewall rules that will be applied to the launched instances.
+          Defaults to the user's default group if not supplied.
+
+     -k, --key KEYPAIR
+          Specifies the key pair to use when launching the instance(s).
+
+     -m, --monitor
+          Enables monitoring of the specified instance(s).
+
+     -n, --instance-count MIN[-MAX]
+          The number of instances to attempt to launch. May be specified as a
+          single integer or as a range (min-max). This specifies the minumum
+          and maximum number of instances to attempt to launch. If a single
+          integer is specified min and max are both set to that value.
+
+     -s, --subnet SUBNET
+          The ID of the Amazon VPC subnet in which to launch the instance(s).
+
+     -t, --instance-type TYPE
+          Specifies the type of instance to be launched. Refer to the latest
+          Developer's Guide for valid values.
+
+     -z, --availability-zone ZONE
+          Specifies the availability zone to launch the instance(s) in. Run the
+          'ec2-describe-availability-zones' command for a list of values, and
+          see the latest Developer's Guide for their meanings.
+
+     --disable-api-termination
+          Indicates that the instance(s) may not be terminated using the
+          TerminateInstances API call.
+
+     --instance-initiated-shutdown-behavior BEHAVIOR
+          Indicates what the instance(s) should do if an on instance shutdown
+          is issued. The following values are supported
+          
+           - 'stop': indicates that the instance should move into the stopped
+              state and remain available to be restarted.
+          
+           - 'terminate': indicates that the instance should move into the
+              terminated state.
+
+     --kernel KERNEL
+          Specifies the ID of the kernel to launch the instance(s) with.
+
+     --ramdisk RAMDISK
+          Specifies the ID of the ramdisk to launch the instance(s) with.
+
+     --placement-group GROUP_NAME
+          Specifies the placement group into which the instances 
+          should be launched.
+
+     --private-ip-address IP_ADDRESS
+          Specifies the private IP address to use when launching an 
+          Amazon VPC instance.
     """
     try:
         opts,args = ec2run_parser.parse_args(parameter_s.split())
@@ -338,8 +402,14 @@ def ec2ssh(self, parameter_s):
             time.sleep(1)
 
     if not ssh_live(inst.ip_address):
+        count = 0
         print 'Waiting for %s SSH port...' % inst.id
-        while not ssh_live(inst.ip_address):
+        # must succeed 3 times to be sure SSH is alive
+        while count < 3:
+            if ssh_live(inst.ip_address):
+                count += 1
+            else:
+                count = 0
             time.sleep(1)
             
     if inst.state == 'running':
