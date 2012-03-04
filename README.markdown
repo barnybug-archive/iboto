@@ -98,20 +98,26 @@ Leaving iboto
 
 Installation
 ------------
-There is no need to install, but you will need python, the ipython library and the boto library.
-You can install the two libraries with easy_install:
+    $ pip install iboto
 
-    $ easy_install boto==2.0b3
-    $ easy_install ipython
+You can then run iboto from your path:
 
-To configure:
+    $ iboto
+ 
+AWS Credentials
+---------------
 
-    $ cp config.py.template config.py
+Your credentials can be set through environment variables:
 
-Then edit config.py.
+    AWS_ACCESS_KEY_ID - Your AWS Access Key ID
+    AWS_SECRET_ACCESS_KEY - Your AWS Secret Access Key
 
-You need to either have your Amazon credentials in the environment as AWS_ACCESS_KEY_ID
-and AWS_SECRET_ACCESS_KEY, or you can configure your details in config.py.
+Alternatively they can be configured in the boto configuration file,
+in short, create  ~/.boto with the content:
+
+    [Credentials]
+    aws_access_key_id = <your access key>
+    aws_secret_access_key = <your secret key>
 
 Help
 ----

@@ -24,11 +24,11 @@ except:
     sys.exit(-1)
 
 try:
-    from IPython.Shell import IPShellEmbed
+    from IPython.frontend.terminal.embed import InteractiveShellEmbed
+    from IPython.config.loader import Config
 except:
-    print >>sys.stderr, "You need ipython installed to run iboto:\n$ easy_install ipython\nor\n$ pip install ipython"
+    print >>sys.stderr, "You need ipython >= 0.11 installed to run iboto:\n$ pip install --upgrade ipython"
     sys.exit(-1)
-args = ['-p','ec2']
 
 banner = """iboto ready
 
@@ -45,7 +45,12 @@ Commands available:
 '%command?' for more information.
 """
 
-ipshell = IPShellEmbed(args,
-                       banner = banner,
-                       exit_msg = 'Leaving iboto')
+cfg = Config()
+cfg.TerminalInteractiveShell.confirm_exit = False # turn off annoyance
+
+ipshell = InteractiveShellEmbed(
+    config = cfg,
+    banner1 = banner,
+    exit_msg = 'Leaving iboto')
+ipshell.extension_manager.load_extension('iboto.ipythonext')
 ipshell()

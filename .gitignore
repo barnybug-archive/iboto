@@ -1,2 +1,3 @@
-# avoid checking credentials into git!
-config.py
+dist
+iboto.egg-info
+build

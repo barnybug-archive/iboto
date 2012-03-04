@@ -1,8 +1,52 @@
+from IPython.core.error import UsageError
+
+def load_ipython_extension(ipython):    
+    ipython.define_magic('ec2ssh', ec2ssh)
+    ipython.define_magic('ec2din', ec2din)
+    ipython.define_magic('ec2-describe-instances', ec2din)
+    ipython.define_magic('ec2watch', ec2watch)
+    ipython.define_magic('region', region)
+    ipython.define_magic('ec2run', ec2run)
+    ipython.define_magic('ec2-run-instances', ec2run)
+
+    _define_ec2cmd(ipython, 'ec2start', 'start', 'start_instances', 'stopped')
+    _define_ec2cmd(ipython, 'ec2-start-instances', 'start', 'start_instances', 'stopped')
+    _define_ec2cmd(ipython, 'ec2stop', 'stop', 'stop_instances', 'running')
+    _define_ec2cmd(ipython, 'ec2-stop-instances', 'stop', 'stop_instances', 'running')
+
+    _define_ec2cmd(ipython, 'ec2kill', 'terminate', 'terminate_instances', 'running')
+    _define_ec2cmd(ipython, 'ec2-terminate-instances', 'terminate', 'terminate_instances', 'running')
+    
+    ipython.set_hook('complete_command', ec2run_completers, re_key = '%?ec2run')
+    ipython.set_hook('complete_command', ec2run_completers, re_key = '%?ec2-run-instances')
+    ipython.set_hook('complete_command',
+                instance_completer_factory(filters={'instance-state-name': 'running'}),
+                re_key = '%?ec2ssh')
+    ipython.set_hook('complete_command', region_completers, re_key = '%?region')
+
+    # make boto available in shell
+    ipython.ex('import boto.ec2')
+
+    ######################################################
+    # ipython environment
+    ######################################################
+    
+    # set variables in ipython ns
+    
+    # set prompt to region name
+    #o = ip.options
+    #o.prompt_in1 = r'${ec2.region.name} <\#>:'
+    #o.prompt_in2 = r'   .\D.:'
+    #o.prompt_out = r'Out<\#>:'
+    #
+    ## remove blank lines between
+    #o.separate_in = ''
+    #o.separate_out = ''
+    #o.separate_out2 = '\n'
+
 # ipython module
 
 import os, re, time, optparse, ConfigParser
-import IPython.ipapi
-from IPython.ipstruct import Struct
 import boto.ec2
 import socket
 
@@ -10,11 +54,8 @@ import socket
 # TODO handle spaces in tags (completion)
 # TODO autogenerate ec2run docstring
 
-ip = IPython.ipapi.get()
 region = os.environ.get('EC2_REGION', 'us-east-1')
 ec2 = boto.ec2.connect_to_region(region)
-ip.user_ns['ec2'] = ec2
-ip.options.confirm_exit = False # turn off annoyance
 
 # Find out our user id - query for a security group
 sg = ec2.get_all_security_groups()[0]
@@ -64,14 +105,8 @@ def build_ami_list():
         ami[n] = str(img.id)
     
     return ami
-ami = build_ami_list()
-
-def expose_magic(*args):
-    def _d(fn):
-        for arg in args:
-            ip.expose_magic(arg, fn)
-        return fn
-    return _d
+# disabled for now
+#ami = build_ami_list()
 
 ######################################################
 # magic ec2run
@@ -111,7 +146,6 @@ ec2run_parameters = []
 for o in ec2run_parser.option_list:
     ec2run_parameters.extend(o._short_opts + o._long_opts)
 
-@expose_magic('ec2run', 'ec2-run-instances')
 def ec2run(self, parameter_s):
     """Launch a number of instances of the specified AMI.
 
@@ -188,11 +222,11 @@ def ec2run(self, parameter_s):
     try:
         opts,args = ec2run_parser.parse_args(parameter_s.split())
     except Exception, ex:
-        raise IPython.ipapi.UsageError, str(ex)
+        raise UsageError, str(ex)
         return
 
     if not args:
-        raise IPython.ipapi.UsageError, '%ec2run needs an AMI specifying'
+        raise UsageError, '%ec2run needs an AMI specifying'
         return
 
     run_args = {}
@@ -283,9 +317,6 @@ def ec2run_completers(self, event):
                     if v in params: params.remove(v)
         return params + ami.keys()
 
-ip.set_hook('complete_command', ec2run_completers, re_key = '%?ec2run')
-ip.set_hook('complete_command', ec2run_completers, re_key = '%?ec2-run-instances')
-
 re_inst_id = re.compile(r'i-\w+')
 re_tag = re.compile(r'(\w+):(.+)')
 states = ('running', 'stopped')
@@ -336,16 +367,16 @@ def args_instances(args, default='error'):
         for qs in args:
             insts = resolve_instances(qs)
             if not insts:
-                raise IPython.ipapi.UsageError, 'Instance not found for %r' % qs
+                raise UsageError, 'Instance not found for %r' % qs
                 return []
             instances.extend(insts)
     elif default=='all':
         instances = list_instances(ec2.get_all_instances())
     else:
-        raise IPython.ipapi.UsageError, 'Command needs an instance specifying'
+        raise UsageError, 'Command needs an instance specifying'
 
     if not instances:
-        raise IPython.ipapi.UsageError, 'No instances found'
+        raise UsageError, 'No instances found'
 
     return instances
 
@@ -364,7 +395,6 @@ def ssh_live(ip, port=22):
     except:
         return False
 
-@expose_magic('ec2ssh')
 def ec2ssh(self, parameter_s):
     """SSH to a running instance.
 
@@ -395,7 +425,7 @@ def ec2ssh(self, parameter_s):
         qs = re_user.sub('', qs)
     
     if not qs:
-        raise IPython.ipapi.UsageError, '%ec2ssh needs an instance specifying'
+        raise UsageError, '%ec2ssh needs an instance specifying'
 
     inst = resolve_instance(qs)
     print 'Instance %s' % inst.id
@@ -442,15 +472,11 @@ def instance_completer_factory(filters):
             print ex
     return _completer
 
-ip.set_hook('complete_command',
-            instance_completer_factory(filters={'instance-state-name': 'running'}),
-            re_key = '%?ec2ssh')
-
 ######################################################
 # generic methods for ec2start, ec2stop, ec2kill
 ######################################################
 
-def _define_ec2cmd(cmd, verb, method, state):
+def _define_ec2cmd(ip, cmd, verb, method, state):
     filters = {'instance-state-name': state}
     
     def _ec2cmd(self, parameter_s):
@@ -479,38 +505,12 @@ def _define_ec2cmd(cmd, verb, method, state):
       %%%(cmd)s i-1<TAB>     - tab complete of instances with a instance id starting i-1.
       %%%(cmd)s Name:<TAB>   - tab complete of instances with a tag 'Name'.
       """ % dict(verb=verb, cmd=cmd, uverb=verb.capitalize(), state=state)
-    ip.expose_magic(cmd, fn)
+    ip.define_magic(cmd, fn)
 
     ip.set_hook('complete_command',
                 instance_completer_factory(filters=filters),
                 re_key = '%?'+cmd)
 
-######################################################
-# magic ec2start
-######################################################
-
-_define_ec2cmd('ec2start', 'start', 'start_instances', 'stopped')
-_define_ec2cmd('ec2-start-instances', 'start', 'start_instances', 'stopped')
-
-######################################################
-# magic ec2stop
-######################################################
-
-_define_ec2cmd('ec2stop', 'stop', 'stop_instances', 'running')
-_define_ec2cmd('ec2-stop-instances', 'stop', 'stop_instances', 'running')
-
-######################################################
-# magic ec2kill
-######################################################
-
-_define_ec2cmd('ec2kill', 'terminate', 'terminate_instances', 'running')
-_define_ec2cmd('ec2-terminate-instances', 'terminate', 'terminate_instances', 'running')
-
-######################################################
-# magic ec2din
-######################################################
-
-@expose_magic('ec2din', 'ec2-describe-instances')
 def ec2din(self, parameter_s):
     """List and describe your instances.
 
@@ -562,7 +562,6 @@ def _watch_step(args, instances, monitor_fields):
 
     return new_instances
 
-@expose_magic('ec2watch')
 def ec2watch(self, parameter_s):
     """Watch for changes in any properties on instances.
 
@@ -588,7 +587,6 @@ def ec2watch(self, parameter_s):
 
 regions = [ r.name for r in boto.ec2.regions() ]
 
-@expose_magic('region')
 def region(self, parameter_s):
     """Switch the default region.
     
@@ -597,7 +595,7 @@ def region(self, parameter_s):
     """
     parameter_s = parameter_s.strip()
     if parameter_s not in regions:
-        raise IPython.ipapi.UsageError, '%region should be one of %s' % ', '.join(regions)
+        raise UsageError, '%region should be one of %s' % ', '.join(regions)
     region = parameter_s
 
     global ec2, ami
@@ -609,27 +607,6 @@ def region(self, parameter_s):
 
 def region_completers(self, event):
     return regions
-ip.set_hook('complete_command', region_completers, re_key = '%?region')
 
 def set_region(self, region, args):
     print 'set_region: %s' % region
-
-######################################################
-# ipython environment
-######################################################
-
-# make boto available in shell    
-ip.ex('import boto.ec2')
-
-# set variables in ipython ns
-
-# set prompt to region name
-o = ip.options
-o.prompt_in1 = r'${ec2.region.name} <\#>:'
-o.prompt_in2 = r'   .\D.:'
-o.prompt_out = r'Out<\#>:'
-
-# remove blank lines between
-o.separate_in = ''
-o.separate_out = ''
-o.separate_out2 = '\n'
