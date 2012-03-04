@@ -5,7 +5,7 @@ import sys
 # check boto installed and new enough
 try:
     import boto
-    major, minor = boto.Version.split('.', 1)
+    major, minor, _ = boto.Version.split('.', 2)
     if 'b' in minor:
         minor, beta = minor.split('b')
         if beta:

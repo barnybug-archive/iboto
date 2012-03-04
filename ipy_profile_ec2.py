@@ -4,7 +4,6 @@ import os, re, time, optparse, ConfigParser
 import IPython.ipapi
 from IPython.ipstruct import Struct
 import boto.ec2
-import config
 import socket
 
 # TODO better exception handling in completers
@@ -12,11 +11,10 @@ import socket
 # TODO autogenerate ec2run docstring
 
 ip = IPython.ipapi.get()
-region = getattr(config, 'DEFAULT_REGION', 'us-east-1')
-creds = dict(aws_access_key_id=config.AWS_ACCESS_KEY_ID,
-             aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY)
-ec2 = boto.ec2.connect_to_region(region, **creds)
+region = os.environ.get('EC2_REGION', 'us-east-1')
+ec2 = boto.ec2.connect_to_region(region)
 ip.user_ns['ec2'] = ec2
+ip.options.confirm_exit = False # turn off annoyance
 
 # Find out our user id - query for a security group
 sg = ec2.get_all_security_groups()[0]
@@ -290,6 +288,7 @@ ip.set_hook('complete_command', ec2run_completers, re_key = '%?ec2-run-instances
 
 re_inst_id = re.compile(r'i-\w+')
 re_tag = re.compile(r'(\w+):(.+)')
+states = ('running', 'stopped')
 def resolve_instances(arg, filters=None):
     inst = None
     if arg == 'latest':
@@ -313,8 +312,15 @@ def resolve_instances(arg, filters=None):
     if m:
         r = ec2.get_all_instances(filters={'tag:%s' % m.group(1): m.group(2)})
         return list_instances(r)
-
-    return []
+        
+    # "running" or "stopped"
+    if arg in states:
+        r = ec2.get_all_instances(filters={'instance-state-name': arg})
+        return list_instances(r)
+        
+    # assume Name: substring match
+    r = ec2.get_all_instances()
+    return [ i for i in iter_instances(r) if arg in i.tags.get('Name', '') ]
 
 def resolve_instance(arg, filters=None):
     insts = resolve_instances(arg, filters)
@@ -330,8 +336,8 @@ def args_instances(args, default='error'):
         for qs in args:
             insts = resolve_instances(qs)
             if not insts:
-                print 'Instance not found for %s' % qs
-                return
+                raise IPython.ipapi.UsageError, 'Instance not found for %r' % qs
+                return []
             instances.extend(insts)
     elif default=='all':
         instances = list_instances(ec2.get_all_instances())
@@ -392,31 +398,32 @@ def ec2ssh(self, parameter_s):
         raise IPython.ipapi.UsageError, '%ec2ssh needs an instance specifying'
 
     inst = resolve_instance(qs)
-    if not inst:
-        print 'Instance not found for %s' % qs
-        return
-        
-    if inst.state == 'pending':
-        print 'Waiting for %s pending->running...' % inst.id
-        while inst.update() == 'pending':
-            time.sleep(1)
+    print 'Instance %s' % inst.id
 
-    if not ssh_live(inst.ip_address):
-        count = 0
-        print 'Waiting for %s SSH port...' % inst.id
-        # must succeed 3 times to be sure SSH is alive
-        while count < 3:
-            if ssh_live(inst.ip_address):
-                count += 1
-            else:
-                count = 0
-            time.sleep(1)
-            
-    if inst.state == 'running':
-        print 'Connecting to %s...' % inst.public_dns_name
-        ip.system('ssh %s %s%s' % (ssh_args, username, inst.public_dns_name))
-    else:
-        print 'Failed, instance %s is not running (%s)' % (inst.id, inst.state)
+    try:    
+        if inst.state == 'pending':
+            print 'Waiting for %s pending->running... (Ctrl+C to abort)' % inst.id
+            while inst.update() == 'pending':
+                time.sleep(1)
+    
+        if not ssh_live(inst.ip_address):
+            count = 0
+            print 'Waiting for %s SSH port... (Ctrl+C to abort)' % inst.id
+            # must succeed 3 times to be sure SSH is alive
+            while count < 3:
+                if ssh_live(inst.ip_address):
+                    count += 1
+                else:
+                    count = 0
+                time.sleep(1)
+                
+        if inst.state == 'running':
+            print 'Connecting to %s... (Ctrl+C to abort)' % inst.public_dns_name
+            ip.system('ssh %s %s%s' % (ssh_args, username, inst.public_dns_name))
+        else:
+            print 'Failed, instance %s is not running (%s)' % (inst.id, inst.state)
+    except KeyboardInterrupt:
+        pass
         
     return str(inst.id)
 
@@ -567,6 +574,7 @@ def ec2watch(self, parameter_s):
 
     args = parameter_s.split()
     instances = args_instances(args, default='all')
+    print 'Watching %d instance(s) (press Ctrl+C to end)' % len(instances)
     try:
         while True:
             time.sleep(interval)
@@ -578,7 +586,7 @@ def ec2watch(self, parameter_s):
 # magic regions
 ######################################################
 
-regions = [ r.name for r in boto.ec2.regions(**creds) ]
+regions = [ r.name for r in boto.ec2.regions() ]
 
 @expose_magic('region')
 def region(self, parameter_s):
@@ -593,7 +601,7 @@ def region(self, parameter_s):
     region = parameter_s
 
     global ec2, ami
-    ec2 = boto.ec2.connect_to_region(region, **creds)    
+    ec2 = boto.ec2.connect_to_region(region)    
     ip.user_ns['ec2'] = ec2
 
     # update ami list
