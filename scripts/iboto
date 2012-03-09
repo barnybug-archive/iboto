@@ -47,10 +47,13 @@ Commands available:
 
 cfg = Config()
 cfg.TerminalInteractiveShell.confirm_exit = False # turn off annoyance
+cfg.PromptManager.in_template = '{ec2_region_name} [\#]: '
+cfg.PromptManager.in_template
 
 ipshell = InteractiveShellEmbed(
     config = cfg,
     banner1 = banner,
-    exit_msg = 'Leaving iboto')
+    exit_msg = 'Leaving iboto',
+    user_ns = {})
 ipshell.extension_manager.load_extension('iboto.ipythonext')
 ipshell()

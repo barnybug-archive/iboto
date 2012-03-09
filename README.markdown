@@ -39,7 +39,7 @@ It's probably best illustrated with a demo session...
 Demo
 ----
 <pre><code>
-./iboto
+$ iboto
 iboto ready
 
 Commands available:

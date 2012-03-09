@@ -1,54 +1,41 @@
 from IPython.core.error import UsageError
 
-def load_ipython_extension(ipython):    
-    ipython.define_magic('ec2ssh', ec2ssh)
-    ipython.define_magic('ec2din', ec2din)
-    ipython.define_magic('ec2-describe-instances', ec2din)
-    ipython.define_magic('ec2watch', ec2watch)
-    ipython.define_magic('region', region)
-    ipython.define_magic('ec2run', ec2run)
-    ipython.define_magic('ec2-run-instances', ec2run)
-
-    _define_ec2cmd(ipython, 'ec2start', 'start', 'start_instances', 'stopped')
-    _define_ec2cmd(ipython, 'ec2-start-instances', 'start', 'start_instances', 'stopped')
-    _define_ec2cmd(ipython, 'ec2stop', 'stop', 'stop_instances', 'running')
-    _define_ec2cmd(ipython, 'ec2-stop-instances', 'stop', 'stop_instances', 'running')
-
-    _define_ec2cmd(ipython, 'ec2kill', 'terminate', 'terminate_instances', 'running')
-    _define_ec2cmd(ipython, 'ec2-terminate-instances', 'terminate', 'terminate_instances', 'running')
-    
-    ipython.set_hook('complete_command', ec2run_completers, re_key = '%?ec2run')
-    ipython.set_hook('complete_command', ec2run_completers, re_key = '%?ec2-run-instances')
-    ipython.set_hook('complete_command',
-                instance_completer_factory(filters={'instance-state-name': 'running'}),
-                re_key = '%?ec2ssh')
-    ipython.set_hook('complete_command', region_completers, re_key = '%?region')
-
-    # make boto available in shell
-    ipython.ex('import boto.ec2')
-
-    ######################################################
-    # ipython environment
-    ######################################################
-    
-    # set variables in ipython ns
-    
-    # set prompt to region name
-    #o = ip.options
-    #o.prompt_in1 = r'${ec2.region.name} <\#>:'
-    #o.prompt_in2 = r'   .\D.:'
-    #o.prompt_out = r'Out<\#>:'
-    #
-    ## remove blank lines between
-    #o.separate_in = ''
-    #o.separate_out = ''
-    #o.separate_out2 = '\n'
-
-# ipython module
-
+import datetime
 import os, re, time, optparse, ConfigParser
 import boto.ec2
 import socket
+
+def load_ipython_extension(ipython):
+    global ip
+    ip = ipython
+
+    ip.define_magic('ec2ssh', ec2ssh)
+    ip.define_magic('ec2din', ec2din)
+    ip.define_magic('ec2-describe-instances', ec2din)
+    ip.define_magic('ec2watch', ec2watch)
+    ip.define_magic('region', region)
+    ip.define_magic('ec2run', ec2run)
+    ip.define_magic('ec2-run-instances', ec2run)
+
+    _define_ec2cmd(ip, 'ec2start', 'start', 'start_instances', 'stopped')
+    _define_ec2cmd(ip, 'ec2-start-instances', 'start', 'start_instances', 'stopped')
+    _define_ec2cmd(ip, 'ec2stop', 'stop', 'stop_instances', 'running')
+    _define_ec2cmd(ip, 'ec2-stop-instances', 'stop', 'stop_instances', 'running')
+
+    _define_ec2cmd(ip, 'ec2kill', 'terminate', 'terminate_instances', 'running')
+    _define_ec2cmd(ip, 'ec2-terminate-instances', 'terminate', 'terminate_instances', 'running')
+    
+    ip.set_hook('complete_command', instance_completer_factory({}), re_key = '%?ec2din')
+    ip.set_hook('complete_command', instance_completer_factory({}), re_key = '%?ec2watch')
+    ip.set_hook('complete_command', ec2run_completers, re_key = '%?ec2run')
+    ip.set_hook('complete_command', ec2run_completers, re_key = '%?ec2-run-instances')
+    ip.set_hook('complete_command',
+                instance_completer_factory(filters={'instance-state-name': 'running'}),
+                re_key = '%?ec2ssh')
+    ip.set_hook('complete_command', region_completers, re_key = '%?region')
+    
+    ip.user_ns['ec2_region_name'] = ec2.region.name
+    ip.user_ns['ec2'] = ec2
 
 # TODO better exception handling in completers
 # TODO handle spaces in tags (completion)
@@ -319,7 +306,9 @@ def ec2run_completers(self, event):
 
 re_inst_id = re.compile(r'i-\w+')
 re_tag = re.compile(r'(\w+):(.+)')
+re_ami = re.compile(r'ami-\w+')
 states = ('running', 'stopped')
+archs = ('i386', 'x86_64')
 def resolve_instances(arg, filters=None):
     inst = None
     if arg == 'latest':
@@ -339,6 +328,11 @@ def resolve_instances(arg, filters=None):
             # partial id
             return [ i for i in iter_instances(ec2.get_all_instances()) if i.id.startswith(arg) ]
 
+    m = re_ami.match(arg)
+    if m:
+        r = ec2.get_all_instances(filters={'image-id': arg})
+        return list_instances(r)
+    
     m = re_tag.match(arg)
     if m:
         r = ec2.get_all_instances(filters={'tag:%s' % m.group(1): m.group(2)})
@@ -347,6 +341,10 @@ def resolve_instances(arg, filters=None):
     # "running" or "stopped"
     if arg in states:
         r = ec2.get_all_instances(filters={'instance-state-name': arg})
+        return list_instances(r)
+        
+    if arg in archs:
+        r = ec2.get_all_instances(filters={'architecture': arg})
         return list_instances(r)
         
     # assume Name: substring match
@@ -367,7 +365,7 @@ def args_instances(args, default='error'):
         for qs in args:
             insts = resolve_instances(qs)
             if not insts:
-                raise UsageError, 'Instance not found for %r' % qs
+                raise UsageError, "Instance not found for '%s'" % qs
                 return []
             instances.extend(insts)
     elif default=='all':
@@ -428,6 +426,8 @@ def ec2ssh(self, parameter_s):
         raise UsageError, '%ec2ssh needs an instance specifying'
 
     inst = resolve_instance(qs)
+    if not inst:
+        raise UsageError, "Instance not found for '%s'" % qs
     print 'Instance %s' % inst.id
 
     try:    
@@ -467,7 +467,10 @@ def instance_completer_factory(filters):
                 for k, v in i.tags.iteritems():
                     instances.append('%s:%s' % (k, v))
         
-            return instances
+            instances.extend(states)
+            instances.extend(archs)
+            
+            return [ i for i in instances if i.startswith(event.symbol) ]
         except Exception, ex:
             print ex
     return _completer
@@ -519,10 +522,11 @@ def ec2din(self, parameter_s):
     """
     args = parameter_s.split()
     instances = args_instances(args, default='all')
-    print '%-11s %-8s %-9s %-11s %-13s %-25s %s' % ('instance', 'state', 'type', 'zone', 'ami', 'launch time', 'name')
+    print '%-11s %-8s %-9s %-11s %-13s %-17s %s' % ('instance', 'state', 'type', 'zone', 'ami', 'launch time', 'name')
     print '='*95
     for i in instances:
-        print '%-11s %-8s %-9s %-11s %-13s %-25s %s' % (i.id, i.state[0:8], i.instance_type, i.placement, i.image_id, i.launch_time, i.tags.get('Name',''))
+        d = datetime.datetime.strptime(i.launch_time, '%Y-%m-%dT%H:%M:%S.000Z')
+        print '%-11s %-8s %-9s %-11s %-13s %-17s %s' % (i.id, i.state[0:8], i.instance_type, i.placement, i.image_id, d.strftime('%Y-%m-%d %H:%M'), i.tags.get('Name',''))
 
 ######################################################
 # magic ec2watch
@@ -597,10 +601,10 @@ def region(self, parameter_s):
     if parameter_s not in regions:
         raise UsageError, '%region should be one of %s' % ', '.join(regions)
     region = parameter_s
-
-    global ec2, ami
-    ec2 = boto.ec2.connect_to_region(region)    
+    global ec2, ami, ip
+    ec2 = boto.ec2.connect_to_region(region)
     ip.user_ns['ec2'] = ec2
+    ip.user_ns['ec2_region_name'] = ec2.region.name
 
     # update ami list
     ami = build_ami_list()
