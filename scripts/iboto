@@ -34,20 +34,23 @@ banner = """iboto ready
 
 Commands available:
 %ec2ssh
-%ec2run   (aka %ec2-run-instances)
-%ec2start (aka %ec2-start-instances)
-%ec2stop  (aka %ec2-stop-instances)
-%ec2kill  (aka %ec2-terminate-instances)
-%ec2din   (aka %ec2-describe-instances)
+%ec2run
+%ec2start
+%ec2stop
+%ec2kill
+%ec2din
 %ec2watch
+%account
 %region
+%limit   (aka .)
+%pop
 
 '%command?' for more information.
 """
 
 cfg = Config()
 cfg.TerminalInteractiveShell.confirm_exit = False # turn off annoyance
-cfg.PromptManager.in_template = '{ec2_region_name} [\#]: '
+cfg.PromptManager.in_template = '{ctx}\n[\#]: '
 cfg.PromptManager.in_template
 
 ipshell = InteractiveShellEmbed(
