@@ -8,19 +8,87 @@ import boto.ec2
 import socket
 import itertools
 from IPython.core.error import UsageError
+from IPython.utils.io import ask_yes_no
 import ConfigParser
+from IPython.config.configurable import Configurable
+from IPython.utils.traitlets import Unicode, Instance, List, Any
+import urllib2
 
-class Account(object):
-    def __init__(self, name, access_key, secret_key, default_regions):
-        self.name = name
-        self.access_key = access_key
-        self.secret_key = secret_key
-        self.default_regions = default_regions
-        
+def load_ipython_extension(ipython):
+    global ip
+    ip = ipython
+
+    ip.define_magic('ec2ssh', ec2ssh)
+    ip.define_magic('ec2din', ec2din)
+    ip.define_magic('ls', ec2din)
+    ip.define_magic('ec2run', ec2run)
+    ip.define_magic('ec2watch', ec2watch)
+
+    ip.define_magic('account', magic_account)
+    ip.define_magic('region', magic_region)
+    ip.define_magic('limit', magic_limit)
+    ip.define_magic('.', magic_limit)
+    ip.define_magic('pop', magic_pop)
+    ip.define_magic('..', magic_pop)
+
+    _define_ec2cmd(ip, 'ec2start', 'start', 'stopped')
+    _define_ec2cmd(ip, 'ec2stop', 'stop', 'running')
+
+    _define_ec2cmd(ip, 'ec2kill', 'terminate', None)
+    
+    ip.set_hook('complete_command', instance_completer_factory(), re_key = '%?ec2din')
+    ip.set_hook('complete_command', instance_completer_factory(), re_key = '%?ec2watch')
+    ip.set_hook('complete_command', ec2run_parameters.completer, re_key = '%?ec2run')
+    ip.set_hook('complete_command', ec2run_parameters.completer, re_key = '%?ec2-run-instances')
+    ip.set_hook('complete_command',
+                instance_completer_factory(filters={'instance-state-name': 'running'}),
+                re_key = '%?ec2ssh')
+    ip.set_hook('complete_command', account_completers, re_key = '%?account')
+    ip.set_hook('complete_command', region_completers, re_key = '%?region')
+    ip.set_hook('complete_command', instance_completer_factory(), re_key = r'%?(limit|\.)')
+    
+    global iboto
+    iboto = IBoto(config=ip.config)
+    iboto.configure()
+    iboto.command_line()
+    ip.user_ns['iboto'] = iboto
+    ip.user_ns['I'] = iboto.instances
+
+######################################################
+# Constants
+######################################################
+
+ARCHS = ('i386', 'x86_64')
+SIZES = ['m1.small', 'm1.large', 'm1.xlarge', 'c1.medium', 'c1.xlarge', 'm2.xlarge', 'm2.2xlarge', 'm2.4xlarge', 'cc1.4xlarge', 't1.micro']
+SIZE_ARCHS = dict( (s, ARCHS) for s in SIZES )
+for i in ('m1.large', 'm1.xlarge', 'c1.xlarge', 'm2.xlarge', 'm2.2xlarge', 'm2.4xlarge', 'cc1.4xlarge'):
+    SIZE_ARCHS[i] = ('x86_64',)
+STATES = ('running', 'stopped')
+EBS_ONLY = ('t1.micro',)
+
+ATTRIBUTE_FILTERS = {
+    'instance_type': SIZES,
+    'architecture': ARCHS,
+    'state': STATES,
+}
+
+######################################################
+# Models
+######################################################
+
+class Account(Configurable):
+    name = Unicode(config=True)
+    access_key = Unicode(config=True)
+    secret_key = Unicode(config=True)
+    regions = List(Unicode, config=True)
+    
     @classmethod
     def default(cls):
         if os.getenv('AWS_ACCESS_KEY_ID') and os.getenv('AWS_SECRET_ACCESS_KEY'):
-            return Account('default', os.getenv('AWS_ACCESS_KEY_ID'), os.getenv('AWS_SECRET_ACCESS_KEY'), os.getenv('EC2_REGION'))
+            return Account(name='default',
+                           access_key=os.getenv('AWS_ACCESS_KEY_ID'),
+                           secret_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+                           regions=[os.getenv('EC2_REGION')])
         return 
 
 class Connection(object):
@@ -30,7 +98,10 @@ class Connection(object):
         self._ec2 = None
         
     def instances(self):
-        return iter_instances(self.ec2.get_all_instances())
+        for r in self.ec2.get_all_instances():
+            for i in r.instances:
+                i.account = self.account.name # hack - for display
+                yield i
         
     @property    
     def ec2(self):
@@ -56,143 +127,307 @@ class ConnectionList(list):
     @property
     def type(self):
         return 'connection'
+    
+class Wizard(object):
+    def __init__(self, filename):
+        self.filename = filename
+        
+    def run(self):
+        print "Looks like this is the first time you are running iboto, let's configure an account:"
+        more = True
+        config = ConfigParser.RawConfigParser()
+        while more:
+            self.account(config)
+            print 'iboto supports multiple accounts.'
+            more = ask_yes_no('Would you like to configure another account? (y/n)')
+            
+        with file(self.filename, 'w') as fout:
+            config.write(fout)
+        print 'Configuration completed.'
+        print 'To add or change accounts in future, edit ~/.iboto/settings.\n'
+        prompt('Hit enter to continue to load iboto', allow_blank=True)
+        
+    def account(self, config):
+        name = prompt('Account name: ')
+        access_key = prompt('AWS Access Key ID: ')
+        secret_key = prompt('AWS Secret Access Key: ')
+        regions = prompt('Regions (%s): ' % ','.join(REGIONS))
+        config.add_section(name)
+        config.set(name, 'aws_access_key_id', access_key)
+        config.set(name, 'aws_secret_access_key', secret_key)
+        config.set(name, 'regions', regions)
 
-class Context(object):
-    def __init__(self, accounts):
-        self.accounts = accounts
-        self.filters = []
+class IBoto(Configurable):
+    accounts = List(Any, config=True)
+    
+    def __init__(self, **kwargs):
+        super(IBoto, self).__init__(**kwargs)
+        self.filters = Filters()
+        self.instances = Instances(self.filters)
         
     def select_all(self):
-        self.filters = [ ConnectionList( Connection(acc, reg) for acc in self.accounts for reg in acc.default_regions ) ]
+        self.filters[:] = Filters([ ConnectionList( Connection(acc, reg) for acc in self.accounts for reg in acc.regions ) ])
+        print self.filters
         
     def select_account(self, name):
         for acc in self.accounts:
             if acc.name == name:
-                self.filters = [ ConnectionList( Connection(acc, reg) for reg in acc.default_regions ) ]
-                break
+                self.filters[:] = Filters([ ConnectionList( Connection(acc, reg) for reg in acc.regions ) ])
+                return True
+        return False
             
     def select_regions(self, names):
         filter = []
         accounts = set(conn.account for conn in self.filters[0] )
-        filter = ConnectionList( Connection(acc, reg) for acc in accounts for reg in names )
-        self.filters[0] = filter
+        self.add_filter(ConnectionList( Connection(acc, reg) for acc in accounts for reg in names ))
         
     def add_filter(self, f):
-        for i, x in enumerate(self.filters):
-            if x.type == f.type:
-                self.filters[i] = f
-                return
-        self.filters.append(f)
+        self.filters.add_filter(f)
         
     def pop_filter(self):
-        if len(self.filters) > 1:
-            self.filters.pop()
+        self.filters.pop_filter()
         
-    def instances(self, post_filter=None):
-        filters = self.filters + (post_filter or [])
-        res = None
-        for f in filters:
-            if not res:
-                res = self.filters[0].instances()
-            else:
-                res = f.filter(res)
-        return res
-    
     def connections(self):
         return self.filters[0]
         
     def __str__(self):
-        return ' '.join( str(f) for f in self.filters )
+        return str(self.filters)
 
-    @classmethod
-    def configure(cls):
-        iboto_cfg = os.path.join(os.getenv('HOME'), '.iboto')
-        if os.path.exists(iboto_cfg):
-            cfg = ConfigParser.RawConfigParser()
-            cfg.read(iboto_cfg)
-            accs = []
-            for section in cfg.sections():
-                access_key = cfg.get(section, 'aws_access_key_id')
-                secret_key = cfg.get(section, 'aws_secret_access_key')
+    def configure(self):
+        iboto_cfg = os.path.join(os.getenv('HOME'), '.iboto/settings')
+        if not os.path.exists(iboto_cfg):
+            Wizard(iboto_cfg).run()
+
+        cfg = ConfigParser.RawConfigParser()
+        cfg.read(iboto_cfg)
+        accs = []
+        for section in cfg.sections():
+            access_key = cfg.get(section, 'aws_access_key_id')
+            secret_key = cfg.get(section, 'aws_secret_access_key')
+            if cfg.has_option(section, 'regions'):
                 regions = cfg.get(section, 'regions').split(',')
-                acc = Account(section, access_key, secret_key, regions)
-                accs.append(acc)
-            return Context(accs)
-        else:
-            return Context([Account.default()])
+            else:
+                regions = REGIONS
+            acc = Account(name=section, access_key=access_key, secret_key=secret_key, regions=regions)
+            self.accounts.append(acc)
             
     def command_line(self):
         args = sys.argv[1:]
         if len(args) > 0:
-            self.select_account(args[0])
+            if not self.select_account(args[0]):
+                raise UsageError, "invalid account specified"
             if len(args) > 1:
                 self.select_regions([args[1]])
         else:
             self.select_all()
 
-class Instances(object):
-    def __init__(self, ctx):
-        self.ctx = ctx
+class Filters(list):
+    def add_filter(self, f):
+        for i, x in enumerate(self):
+            if x.type == f.type:
+                self[i] = f
+                return
+        self.append(f)
         
-    def start(self):
-        self._on_all('start')
-        
-    def stop(self):
-        self._on_all('stop')
-        
-    def _on_all(self, cmd):
-        for i in self.ctx.instances():
-            getattr(i, cmd)()
-            
-    @property
-    def list(self):
-        print 'blah'
-        
-    def __len__(self):
-        return len(list(self.ctx.instances()))
-        
+    def pop_filter(self):
+        if len(self) > 1:
+            self.pop()
+    
+    def resolve(self, post_filter=None):
+        filters = self + (post_filter or [])
+        res = None
+        for f in filters:
+            if not res:
+                res = self[0].instances()
+            else:
+                res = f.filter(res)
+        return res
+    
+    def limit(self, *args):
+        return Filters(self + list(args))
+    
     def __str__(self):
-        return ', '.join( i.id for i in self.ctx.instances() )
+        return ' '.join( str(f) for f in self )
+
+def wraps(source):
+    def _wrapper(dest):
+        dest.__doc__ = source.__doc__
+        return dest
+    return _wrapper
+
+class MultiActions(object):
+    @wraps(boto.ec2.instance.Instance.start)
+    def start(self):
+        return self.limit(StateFilter.stopped)._on_all('start')
+        
+    @wraps(boto.ec2.instance.Instance.stop)
+    def stop(self, force=False):
+        return self.limit(StateFilter.not_stopped)._on_all('stop')
+        
+    @wraps(boto.ec2.instance.Instance.terminate)
+    def terminate(self):
+        return self.limit(StateFilter.not_terminated)._on_all('terminate')
+        
+    @wraps(boto.ec2.instance.Instance.reboot)
+    def reboot(self):
+        return self.limit(StateFilter.not_stopped)._on_all('reboot')
+        
+    @wraps(boto.ec2.instance.Instance.add_tag)
+    def add_tag(self, key, value):
+        return self._on_all('add_tag', key, value)
+        
+    @wraps(boto.ec2.instance.Instance.remove_tag)
+    def remove_tag(self, key, value=''):
+        return self._on_all('remove_tag', key, value)
+        
+    def add_volume(self, size, device):
+        """Create and attach a volume to each instance.
+        
+        """
+        print 'Creating and attaching volumes...'
+        n = 0
+        for i in self:
+            vol = i.connection.create_volume(size, i.placement)
+            vol.attach(i.id, device)
+            n += 1
+        print 'Created %d volumes' % n
+            
+    def delete_volume(self, device, force=False):
+        """Detach and delete the volume from each instance."""
+        print 'Detaching volumes...'
+        volumes = []
+        for i in self:
+            mapping = i.block_device_mapping
+            if device in mapping:
+                bd = mapping[device]
+                i.connection.detach_volume(bd.volume_id, i.id, device, force)
+                volumes.extend(i.connection.get_all_volumes([bd.volume_id]))
+        
+        while volumes:
+            for vol in volumes:
+                vol.update()
+                if vol.status == 'available':
+                    vol.delete()
+                    del volumes[volumes.index(vol)]
+                    
+            time.sleep(1)
+        
+    @property    
+    def name(self):
+        """Get the Name tag from instances"""
+        return [ t.get('Name') for t in self.tags ]
+        
+    @name.setter
+    def name(self, value):
+        """Set the Name tag on instances"""
+        return self.add_tag('Name', value)
+        
+    def _on_all(self, cmd, *args, **kwargs):
+        li = list(self)
+        if len(li) > 1:
+            answer = ask_yes_no('This will %s %d instances, ok? (y/N)' % (cmd, len(li)), default='n')
+            if not answer:
+                return
+        for i in li:
+            getattr(i, cmd)(*args, **kwargs)
+        return Result(li, 'success')
+        
+    def __getattr__(self, name):
+        # credit to idea for this from:
+        # http://www.elastician.com/2009/09/stupid-boto-tricks-1-cross-region.html
+        results = []
+        is_callable = False
+        for i in self:
+            val = getattr(i, name)
+            if callable(val):
+                is_callable = True
+            results.append(val)
+        
+        if is_callable:
+            functions = results
+            def _map(*args, **kwargs):
+                results = []
+                for fn in functions:
+                    results.append(fn(*args, **kwargs))
+                return results
+            return _map
+        else:
+            return results
+            
+    def ls(self, format='%(account)s %(id)-11s %(state)-8s %(instance_type)-9s %(zone)-11s %(ami)-13s %(launch_time)-17s %(name)s'):
+        cols = {'account': 'account',
+                'id': 'instance',
+                'state': 'state',
+                'instance_type': 'type',
+                'zone': 'zone',
+                'ami': 'ami',
+                'launch_time': 'launch time',
+                'name': 'name'}
+        header = format % cols
+        print header
+        print '=' * len(header)
+        for i in self:
+            d = datetime.datetime.strptime(i.launch_time, '%Y-%m-%dT%H:%M:%S.000Z')
+            fd = {'account': i.account[0:7],
+                  'id': i.id,
+                  'state': i.state[0:8],
+                  'instance_type': i.instance_type,
+                  'zone': i.placement[0:10],
+                  'ami': i.image_id,
+                  'launch_time': d.strftime('%Y-%m-%d %H:%M'),
+                  'name': i.tags.get('Name','')}
+            print format % fd
+            
+            
+    def __getitem__(self, i):
+        try:
+            it = iter(self)
+            while i > 0:
+                it.next()
+                i -= 1
+            return it.next()
+        except StopIteration:
+            raise IndexError, 'list index out of range'
+
+    def __len__(self):
+        return len(list(iter(self)))
+    
+class Instances(MultiActions):
+    def __init__(self, filters):
+        self._filters = filters
+                
+    def __str__(self):
+        return ', '.join( i.id for i in self._filters.resolve() )
         
     def __repr__(self):
-        return 'Instances(limit=%s)' % str(self.ctx)
+        return 'Instances(limit=%s)' % str(self._filters)
+        
+    def __iter__(self):
+        return self._filters.resolve()
 
-def load_ipython_extension(ipython):
-    global ip
-    ip = ipython
+    def limit(self, *args):
+        return Instances(self._filters.limit(*args))
 
-    ip.define_magic('ec2ssh', ec2ssh)
-    ip.define_magic('ec2din', ec2din)
-    ip.define_magic('ec2run', ec2run)
-    ip.define_magic('ec2watch', ec2watch)
-
-    ip.define_magic('account', magic_account)
-    ip.define_magic('region', magic_region)
-    ip.define_magic('limit', magic_limit)
-    ip.define_magic('.', magic_limit)
-    ip.define_magic('pop', magic_pop)
-
-    _define_ec2cmd(ip, 'ec2start', 'start', 'stopped')
-    _define_ec2cmd(ip, 'ec2stop', 'stop', 'running')
-
-    _define_ec2cmd(ip, 'ec2kill', 'terminate', None)
-    
-    ip.set_hook('complete_command', instance_completer_factory(), re_key = '%?ec2din')
-    ip.set_hook('complete_command', instance_completer_factory(), re_key = '%?ec2watch')
-    ip.set_hook('complete_command', ec2run_completers, re_key = '%?ec2run')
-    ip.set_hook('complete_command', ec2run_completers, re_key = '%?ec2-run-instances')
-    ip.set_hook('complete_command',
-                instance_completer_factory(filters={'instance-state-name': 'running'}),
-                re_key = '%?ec2ssh')
-    ip.set_hook('complete_command', account_completers, re_key = '%?account')
-    ip.set_hook('complete_command', region_completers, re_key = '%?region')
-    ip.set_hook('complete_command', instance_completer_factory(), re_key = r'%?(limit|\.)')
-    
-    global ctx
-    ctx = Context.configure()
-    ctx.command_line()
-    ip.user_ns['ctx'] = ctx
-    ip.user_ns['i'] = Instances(ctx)
+class Result(MultiActions):
+    def __init__(self, instances, status):
+        self._instances = instances
+        self._status = status
+        
+    def __iter__(self):
+        return iter(self._instances)
+        
+    def instances(self):
+        return iter(self._instances)
+        
+    def limit(self, *args):
+        f = Filters([self])
+        return Instances(f).limit(*args)
+        
+    def __bool__(self):
+        return (self._status == 'success')
+        
+    def __repr__(self):
+        return '<Result: %s, Instances: %s>' % (self._status, ', '.join( i.id for i in self._instances ) or 'None')
 
 # TODO better exception handling in completers
 # TODO handle spaces in tags (completion)
@@ -208,54 +443,110 @@ def to_slug(n):
     n = re_allowed_chars.sub('_', n)
     return n
 
-def iter_instances(reservations):
-    for r in reservations:
-        for i in r.instances:
-            yield i
-    
-def list_instances(reservations):
-    return list(iter_instances(reservations))
-
 def firstinstance(reservations):
     for r in reservations:
         for i in r.instances:
             return i
     return None
 
-def build_ami_list():
-    # AMI list
-    ami = dict()
-    for fname in os.listdir('ami'):
-        fname = os.path.join('ami', fname)
-        cfg = ConfigParser.ConfigParser()
-        cfg.read(fname)
-        s = str(ec2.region.name)
-        if cfg.has_section(s):
-            for o in cfg.options(s):
-                ami[o] = cfg.get(s, o)
-
-    # Add custom AMIs
-    for img in ec2.get_all_images(owners=[owner_id]):
-        n = img.location.split('/')[-1]
-        n = re.sub(r'\.manifest\.xml$', '', n)
-        n = to_slug(n)
-        ami[n] = str(img.id)
-    
-    return ami
-# disabled for now
-#ami = build_ami_list()
+def allinstances(reservations):
+    for r in reservations:
+        for i in r.instances:
+            yield i
 
 ######################################################
 # magic ec2run
 ######################################################
 
-def resolve_ami(arg):
+class AMI(object):
+    def __init__(self, id, name, store, arch, region, aki, virt):
+        self.id = id
+        self.name = name
+        self.store = store
+        self.arch = arch
+        self.region = region
+        self.aki = aki
+        self.virt = virt
+
+class Catalogue(list):
+    def filter(self, attr):
+        for ami in self:
+            if not [ True for k, v in attr.iteritems() if getattr(ami, k, None) != v ]:
+                yield ami
+            
+    @classmethod
+    def instance(cls):
+        inst = cls()
+        cls.instance = lambda: inst
+        return inst
+            
+    def names(self):
+        return set([ a.name for a in self ])
+
+class UbuntuAMICatalogue(Catalogue):
+    def __init__(self, platform):
+        self.fetch(platform)
+        
+    def fetch(self, platform):
+        resp = urllib2.urlopen('http://uec-images.ubuntu.com/query/%s/server/released.current.txt' % platform)
+        for line in resp.read().split('\n'):
+            if not line:
+                continue
+            vs = line.split('\t')
+            dist, s, r, d, store, arch, region, ami, aki, _, virt = vs[0:11]
+            if virt == 'hvm':
+                continue
+            if arch == 'amd64':
+                arch = 'x86_64'
+            self.append(AMI(ami, dist, store, arch, region, aki, virt))
+        
+class Singleton(type):
+    def __init__(cls, name, bases, dict):
+        super(Singleton, cls).__init__(name, bases, dict)
+        cls.instance = None 
+
+    def __call__(cls,*args,**kw):
+        if cls.instance is None:
+            cls.instance = super(Singleton, cls).__call__(*args, **kw)
+        return cls.instance
+
+class AllAMIs(object):
+    __metaclass__ = Singleton
+    
+    def __init__(self):
+        self.catalogues = [UbuntuAMICatalogue('lucid'),
+                           UbuntuAMICatalogue('maverick'),
+                           UbuntuAMICatalogue('natty'),
+                           UbuntuAMICatalogue('oneiric'),
+                           UbuntuAMICatalogue('precise'),
+                        ]
+    
+    def filter(self, attr):
+        for cat in self.catalogues:
+            for ami in cat.filter(attr):
+                yield ami
+                
+    def names(self):
+        names = set()
+        for cat in self.catalogues:
+            names.update(cat.names())
+        return sorted(names)
+        
+def resolve_ami(region, arg, attrs):
     amiid = None
     if arg.startswith('ami-'):
-        amiid = arg
-    elif arg in ami:
-        amiid = ami[arg]
-    return amiid
+        return arg
+    else:
+        attrs['name'] = arg
+        attrs['region'] = region
+        all_amis = AllAMIs()
+        amis = list(all_amis.filter(attrs))
+        if len(amis) == 1:
+            return amis[0].id
+        elif len(amis) == 0:
+            raise UsageError, 'No AMI found: %r' % arg
+        else:
+            raise UsageError, 'Ambiguous AMI: %r' % arg
 
 class enumeration(object):
     def __init__(self, values, multivalued=False):
@@ -292,248 +583,290 @@ class _instance_count(object):
         return 'n or n-m'
 instance_count = _instance_count()
 
-def prompt(p, validate=None, default=None):
+import readline
+class PromptCompleter(object):
+    def __init__(self, completions):
+        self.completions = completions
+        
+    def __call__(self, text, state):
+        options = [ x for x in self.completions if x.startswith(text) ]
+        if state < len(options):
+            return options[state]
+        return None
+
+def prompt(p, validate=None, allow_blank=False, default=None, choices=None):
     while True:
+        if choices:
+            cp = PromptCompleter(choices)
+            readline.set_completer(cp)
+        
         value = raw_input(p)
         if default is not None and value == '':
             if validate:
                 return validate(default)
             else:
                 return default
+        if not allow_blank and value == '':
+            continue
         if validate:
             try:
                 return validate(value)
             except ValueError, ex:
                 print str(ex)
+        else:
+            return value
 
+class Parameters(object):
+    def all_opts(self):
+        ret = []
+        for o in self.options:
+            ret.extend(o.opts)
+        return ret
+    
+    def parser(self):
+        p = CustomOptionParser(prog='%ec2run', usage='%prog [options] AMI\n\nLaunch a number of instances of the specified AMI.')
+        for o in self.options:
+            p.add_option(o.optparse_option())
+            
+        return p
+    
+    def _prompt(self, op, value, ctx, choices):
+        if value:
+            try:
+                return op.validate(value, ctx)
+            except ValueError:
+                pass
+    
+        message = op.title
+        if choices is not None:
+            message = '%s (%s)' % (message, ','.join(str(c) for c in choices))
+        if op.default is None:
+            pass
+        elif op.default is Option.missing:
+            message = '%s [%s]' % (message, 'default')
+        else:
+            message = '%s [%s]' % (message, op.default)
+        return prompt(message + ': ', validate=(lambda x: op.validate(x, ctx)), default=op.default, choices=choices)
+        
+    def parse_args(self, args):
+        p = self.parser()
+        opts, args = p.parse_args(args)
+        run_args = opts.__dict__
+        for op in self.options:
+            if run_args[op.dest] is None:
+                if (op.default is Option.missing or op.default is not None) and not op.prompt:
+                    if op.default is Option.missing:
+                        del run_args[op.dest]
+                    elif op.default is not None:
+                        run_args[op.dest] = op.default
+                        print '%s: %s' % (op.title, op.default)
+                else:
+                    c = op.choices(run_args)
+                    if c and len(c) == 1:
+                        run_args[op.dest] = c[0]
+                        print '%s: %s' % (op.title, c[0])
+                    else:
+                        ret = self._prompt(op, run_args[op.dest], run_args, c)
+                        if ret is Option.missing:
+                            del run_args[op.dest]
+                        else:
+                            run_args[op.dest] = ret
+            else:
+                val = run_args[op.dest]
+                if isinstance(val, list):
+                    val = ', '.join(val)
+                print '%s: %s' % (op.title, val)
+                
+        return run_args, args
+    
+    def usage(self):
+        return self.parser().format_help()
+    
+    def completer(self, ip, event):
+        cmd_param = event.line.split()
+        if event.line.endswith(' '):
+            cmd_param.append('')
+        cmd_param.pop()
+        
+        arg = cmd_param.pop()
+        for o in self.options:
+            if arg in o.opts:
+                return o.choices({})
+
+        params = self.all_opts()
+        # drop from params any already used
+        for c in cmd_param:
+            for o in self.options:
+                if c in o.opts:
+                    for a in o.opts:
+                        params.remove(a)
+        return params
+
+class Option(object):
+    missing = object()
+    
+    def __init__(self, opts, help=None, title=None, metavar=None, choices=None, dest=None, prompt=False, default=None, action=None):
+        self.opts = opts
+        self.help = help
+        self.metavar = metavar
+        self._choices = choices
+        self.prompt = prompt
+        self.default = default
+        self.op = optparse.Option(*opts, dest=dest, help=self.help, metavar=self.metavar, action=action)
+        self.dest = self.op.dest
+        self.title = title or self.dest
+        
+    def optparse_option(self):
+        return self.op
+    
+    def choices(self, ctx):
+        c = self._choices
+        if callable(c):
+            c = c(ctx)
+        return c
+    
+    def validate(self, value, ctx):
+        if value == self.default:
+            return value
+        
+        c = self.choices(ctx)
+        if c is not None:
+            if value not in c:
+                raise ValueError, "Please choose from: %s" % (', '.join(c))
+        return value
+    
+class EC2RunContext(object):
+    def accounts(self, ctx):
+        global iboto
+        l = []
+        for c in iboto.connections():
+            if c.account.name not in l:
+                l.append(c.account.name)
+        return l
+    
+    def regions(self, ctx):
+        global iboto
+        r = []
+        for c in iboto.connections():
+            if c.account.name == ctx['account']:
+                r.append(c.region)
+        return r
+    
+    def _connection(self, ctx):
+        global iboto
+        for c in iboto.connections():
+            if c.account.name == ctx['account'] and c.region == ctx['region']:
+                return c
+    
+    def security_groups(self, ctx):
+        return [ g.name for g in self._connection(ctx).ec2.get_all_security_groups() ]
+        
+    def keypairs(self, ctx):
+        return [ k.name for k in self._connection(ctx).ec2.get_all_key_pairs() ]
+        
+    def zones(self, ctx):
+        return [ z.name for z in self._connection(ctx).ec2.get_all_zones() ]
+        
+    def archs(self, ctx):
+        return SIZE_ARCHS[ ctx['instance_type'] ]
+    
+    def ebss(self, ctx):
+        if ctx['instance_type'] in EBS_ONLY:
+            return ('yes',)
+        else:
+            return ('yes','no')
+            
+    def amis(self, ctx):
+        # limit ami list to those with available region/arch/store
+        amis = AllAMIs().filter({'region': ctx['region'],
+                                 'arch': ctx['arch'],
+                                 'store': (ctx['ebs'] and 'ebs' or 'instance')})
+        li = list(set( a.name for a in amis ))
+        li.sort()
+        li.append(AMIMatch())
+        return li
+
+class AMIMatch(object):
+    def __eq__(self, x):
+        return bool(re_ami.match(x))
+        
+    def __str__(self):
+        return 'ami-xxxxxx'
+        
+class EC2RunParameters(Parameters):
+    context = EC2RunContext()
+    options = [
+        Option(['--account'], title='account', choices=context.accounts, metavar='ACCOUNT', help='Account in which to launch instance.'),
+        Option(['--region'], title='region', choices=context.regions, metavar='REGION', help='Region in which to launch instance.'),
+        Option(['-t', '--instance-type'], title='instance type', choices=SIZES, metavar='TYPE', help='Specifies the type of instance to be launched.'),
+        Option(['-n', '--instance-count'], title='number', default='1', prompt=True, metavar='MIN-MAX', help='The number of instances to attempt to launch.'),
+        Option(['-k', '--key'], title='key', dest='key_name', metavar='KEYPAIR', choices=context.keypairs, help='Specifies the key pair to use when launching the instance(s).'),
+        Option(['-g', '--group'], title='security group', dest='security_groups', metavar='GROUP', default=Option.missing, prompt=True, choices=context.security_groups, action='append', help='Specifies the security group.'),
+        Option(['-d', '--user-data'], metavar='DATA', default=Option.missing, help='Specifies the user data to be made available to the instance(s) in this reservation.'),
+        Option(['-f', '--user-data-file'], metavar='DATA-FILE', default=Option.missing, help='Specifies the file containing user data to be made available to the instance(s) in this reservation.'),
+        Option(['-m', '--monitor'], action='store_true', default=Option.missing, help='Enables monitoring of the specified instance(s).'),
+        Option(['-z', '--availability-zone'], dest='placement', title='zone', metavar='ZONE', prompt=True, choices=context.zones, default=Option.missing, help='Specifies the availability zone to launch the instance(s) in.'),
+        Option(['--disable-api-termination'], action='store_true', default=Option.missing, help='Indicates that the instance(s) may not be terminated using the TerminateInstances API call.'),
+        Option(['--instance-initiated-shutdown-behavior'], default=Option.missing, metavar='BEHAVIOR', help='Indicates what the instance(s) should do if an on instance shutdown is issued.'),
+        Option(['--arch'], default='x86_64', dest='arch', prompt=True, metavar='ARCH', choices=context.archs, help='Which architecture to launch.'),
+        Option(['--ebs'], default='x86_64', dest='ebs', prompt=True, metavar='EBS', choices=context.ebss, help='EBS or not.'),
+        Option(['--ami'], dest='ami', prompt=True, metavar='AMI', choices=context.amis, help='AMI to launch'),
+        Option(['-T', '--tags'], metavar='TAG', action='append', help='Add a tag to the launched instance.'),
+    ]
+        
 class CustomOptionParser(optparse.OptionParser):
     def exit(self, status=0, msg=''):
         raise ValueError, msg
-
-ec2run_parser = CustomOptionParser(prog='%ec2run', usage='%prog [options] AMI')
-ec2run_parser.add_option('-k', '--key', metavar='KEYPAIR', help='Specifies the key pair to use when launching the instance(s).')
-ec2run_parser.add_option('-t', '--instance-type', metavar='TYPE', help='Specifies the type of instance to be launched.')
-ec2run_parser.add_option('-n', '--instance-count', metavar='MIN-MAX', help='The number of instances to attempt to launch.')
-ec2run_parser.add_option('-g', '--group', metavar='GROUP', action='append', help='Specifies the security group.')
-ec2run_parser.add_option('-d', '--user-data', metavar='DATA', help='Specifies the user data to be made available to the instance(s) in this reservation.')
-ec2run_parser.add_option('-f', '--user-data-file', metavar='DATA-FILE', help='Specifies the file containing user data to be made available to the instance(s) in this reservation.')
-ec2run_parser.add_option('-m', '--monitor', action='store_true', help='Enables monitoring of the specified instance(s).')
-ec2run_parser.add_option('-z', '--availability-zone', metavar='ZONE', help='Specifies the availability zone to launch the instance(s) in.')
-ec2run_parser.add_option('--disable-api-termination', action='store_true', help='Indicates that the instance(s) may not be terminated using the TerminateInstances API call.')
-ec2run_parser.add_option('--instance-initiated-shutdown-behavior', metavar='BEHAVIOR', help='Indicates what the instance(s) should do if an on instance shutdown is issued.')
-ec2run_parser.add_option('--placement-group', metavar='GROUP_NAME', help='Specifies the placement group into which the instances should be launched.')
-ec2run_parser.add_option('--private-ip-address', metavar='IP_ADDRESS', help='Specifies the private IP address to use when launching an Amazon VPC instance.')
-ec2run_parser.add_option('--kernel', metavar='KERNEL', help='Specifies the ID of the kernel to launch the instance(s) with.')
-ec2run_parser.add_option('--ramdisk', metavar='RAMDISK', help='Specifies the ID of the ramdisk to launch the instance(s) with.')
-ec2run_parser.add_option('--subnet', metavar='SUBNET', help='The ID of the Amazon VPC subnet in which to launch the instance(s).')
-# TODO block device mapping, client-token, addressing
-
-ec2run_parameters = []
-for o in ec2run_parser.option_list:
-    ec2run_parameters.extend(o._short_opts + o._long_opts)
     
-def parse_option(opts, message, validate, value, default=None):
-    if value:
-        try:
-            return validate(value)
-        except ValueError:
-            pass
-
-    if not isinstance(validate, type):
-        message = '%s (%s)' % (message, validate)
-    if default is not None:
-        message = '%s [%s]' % (message, default)
-    return prompt(message + ': ', validate=validate, default=default)
+ec2run_parameters = EC2RunParameters()
 
 def ec2run(self, parameter_s):
-    """Launch a number of instances of the specified AMI.
-
-    Usage:\\
-      %ec2run [options] AMI
-      Almost all the options from the Amazon command line tool are supported:
-      
-     -d, --user-data DATA
-          Specifies the user data to be made available to the instance(s) in
-          this reservation.
-
-     -f, --user-data-file DATA-FILE
-          Specifies the file containing user data to be made available to the
-          instance(s) in this reservation.
-
-     -g, --group GROUP [--group GROUP...]
-          Specifies the security group (or groups if specified multiple times)
-          within which the instance(s) should be run. Determines the ingress
-          firewall rules that will be applied to the launched instances.
-          Defaults to the user's default group if not supplied.
-
-     -k, --key KEYPAIR
-          Specifies the key pair to use when launching the instance(s).
-
-     -m, --monitor
-          Enables monitoring of the specified instance(s).
-
-     -n, --instance-count MIN[-MAX]
-          The number of instances to attempt to launch. May be specified as a
-          single integer or as a range (min-max). This specifies the minumum
-          and maximum number of instances to attempt to launch. If a single
-          integer is specified min and max are both set to that value.
-
-     -s, --subnet SUBNET
-          The ID of the Amazon VPC subnet in which to launch the instance(s).
-
-     -t, --instance-type TYPE
-          Specifies the type of instance to be launched. Refer to the latest
-          Developer's Guide for valid values.
-
-     -z, --availability-zone ZONE
-          Specifies the availability zone to launch the instance(s) in. Run the
-          'ec2-describe-availability-zones' command for a list of values, and
-          see the latest Developer's Guide for their meanings.
-
-     --disable-api-termination
-          Indicates that the instance(s) may not be terminated using the
-          TerminateInstances API call.
-
-     --instance-initiated-shutdown-behavior BEHAVIOR
-          Indicates what the instance(s) should do if an on instance shutdown
-          is issued. The following values are supported
-          
-           - 'stop': indicates that the instance should move into the stopped
-              state and remain available to be restarted.
-          
-           - 'terminate': indicates that the instance should move into the
-              terminated state.
-
-     --kernel KERNEL
-          Specifies the ID of the kernel to launch the instance(s) with.
-
-     --ramdisk RAMDISK
-          Specifies the ID of the ramdisk to launch the instance(s) with.
-
-     --placement-group GROUP_NAME
-          Specifies the placement group into which the instances 
-          should be launched.
-
-     --private-ip-address IP_ADDRESS
-          Specifies the private IP address to use when launching an 
-          Amazon VPC instance.
-    """
     try:
-        opts,args = ec2run_parser.parse_args(parameter_s.split())
-    except Exception, ex:
-        raise UsageError, str(ex)
+        run_args, args = ec2run_parameters.parse_args(parameter_s.split())
+    except ValueError, ex:
+        print str(ex)
         return
 
-    if not args:
-        raise UsageError, '%ec2run needs an AMI specifying'
-        return
-
-    global ctx
-    connections = ctx.connections()
-    if len(connections) > 1:
-        names = set(c.account.name for c in connections)
-        if len(names) > 1:
-            name = prompt('account (%s): ' % (', '.join(names)), enumeration(names))
-            connections = [ c for c in connections if c.account.name == name ]
-        regions = set(c.region for c in connections )
-        if len(regions) > 1:
-            region = prompt('region (%s): ' % (', '.join(regions)), enumeration(regions))
-        connections = [ c for c in connections if c.region == region ]
+    account = run_args.pop('account')
+    region = run_args.pop('region')
+    global iboto
+    for c in iboto.connections():
+        if c.account.name == account and c.region == region:
+            break
+    connection = c
     
-    connection = connections[0]
-    run_args = {}
-    run_args['instance_type'] = parse_option(opts, 'size', enumeration(SIZES), opts.instance_type)
-    run_args['key_name'] = parse_option(opts, 'key', str, opts.key)
-    a, b = parse_option(opts, 'no. instances', instance_count, opts.instance_count, default='1')
-    run_args['min_count'] = a
-    run_args['max_count'] = b
-    
-    groups = [g.name for g in connection.ec2.get_all_security_groups()]
-    run_args['security_groups'] = parse_option(opts, 'security group', enumeration(groups, multivalued=True), opts.group, default='default')
-
-    zones = [z.name for z in connection.ec2.get_all_zones()]
-    run_args['placement'] = parse_option(opts, 'availability zone', enumeration(zones), opts.availability_zone, default=zones[0])
-
-    if opts.user_data:
-        run_args['user_data'] = opts.user_data
-    elif opts.user_data_file:
-        run_args['user_data'] = file(opts.user_data_file, 'r')
-    if opts.monitor:
-        run_args['monitoring_enabled'] = True
-    if opts.disable_api_termination:
-        run_args['disable_api_termination'] = opts.disable_api_termination
-    if opts.instance_initiated_shutdown_behavior:
-        run_args['instance_initiated_shutdown_behavior'] = opts.instance_initiated_shutdown_behavior
-    if opts.placement_group:
-        run_args['placement_group'] = opts.placement_group
-    if opts.private_ip_address:
-        run_args['private_ip_address'] = opts.private_ip_address
-    if opts.kernel:
-        run_args['kernel_id'] = opts.kernel
-    if opts.ramdisk:
-        run_args['ramdisk_id'] = opts.ramdisk
-    if opts.subnet:
-        run_args['subnet_id'] = opts.subnet
-    
-    run_args['image_id'] = resolve_ami(args[0])
+    instance_count = run_args.pop('instance_count')
+    p = instance_count.split('-')
+    if len(p) == 2:
+        run_args['min_count'], run_args['max_count'] = p
+    else:
+        run_args['min_count'] = run_args['max_count'] = p[0]
+        
+    arch = run_args.pop('arch')
+    ebs = run_args.pop('ebs')
+    aminame = run_args.pop('ami')
+    tags = run_args.pop('tags')
+    run_args['image_id'] = resolve_ami(region, aminame, {'arch': arch, 'store': (ebs == 'yes' and 'ebs' or 'instance')})
     r = connection.ec2.run_instances(**run_args)
     
+    for tag in tags:
+        for i in allinstances([r]):
+            key, value = tag.split(':')
+            i.add_tag(key, value)
+    
     inst = firstinstance([r])
-    return str(inst.id)
+    iboto.add_filter(AttributeFilter('id', inst.id))
+    return Result([inst], 'success')
 
-def ec2run_completers(self, event):
-    cmd_param = event.line.split()
-    if event.line.endswith(' '):
-        cmd_param.append('')
-    arg = cmd_param.pop()
-    
-    arg = cmd_param.pop()
-    if arg in ('-t', '--instance-type'):
-        return SIZES
-    elif arg in ('-k', '--keys'):
-        return [k.name for k in ec2.get_all_key_pairs()]
-    elif arg in ('-n', '--instance-count'):
-        return ['1', '1-'] # just examples really
-    elif arg in ('-g', '--group'):
-        return [g.name for g in ec2.get_all_security_groups()]
-    elif arg in ('-d', '--user-data'):
-        return []
-    elif arg in ('-f', '--user-data-file'):
-        return [] # TODO hook normal file complete
-    elif arg in ('-z', '--availability-zone'):
-        return [z.name for z in ec2.get_all_zones()]
-    elif arg in ('--instance-initiated-shutdown-behavior'):
-        return ['stop', 'terminate']
-    elif arg in ('--placement-group'):
-        return [g.name for g in ec2.get_all_placement_groups()]
-    elif arg in ('--private-ip-address'):
-        return []
-    elif arg in ('--kernel'):
-        return [] # TODO
-    elif arg in ('--ramdisk'):
-        return [] # TODO
-    elif arg in ('--subnet'):
-        return [] # TODO
-    else:
-        params = ec2run_parameters[:]
-        # drop from params any already used
-        for c in cmd_param:
-            o = ec2run_parser.get_option(c)
-            if o:
-                for v in o._short_opts + o._long_opts:
-                    if v in params: params.remove(v)
-        return params + ami.keys()
+ec2run.__doc__ = ec2run_parameters.usage()
 
-def args_instances(parameter_s, filters=None):
-    if not filters:
-        filters = []
+def args_instances(parameter_s):
     if parameter_s:
-        filters = filters + parse_filter_list(parameter_s)
+        filters = parse_filter_list(parameter_s)
+    else:
+        filters = []
     
-    instances = ctx.instances(filters)
-    if not instances:
-        raise UsageError, 'No instances found'
-
+    instances = iboto.instances.limit(*filters)
     return instances
 
 ######################################################
@@ -572,7 +905,10 @@ def ec2ssh(self, parameter_s):
     """
     
     args = parameter_s.split()
-    qs = args.pop()
+    if args:
+        qs = args.pop()
+    else:
+        qs = ''
     ssh_args = ' '.join(args)
     username = ''
     m = re_user.match(qs)
@@ -580,14 +916,14 @@ def ec2ssh(self, parameter_s):
         username = m.group(1)
         qs = re_user.sub('', qs)
     
-    if not qs:
-        raise UsageError, '%ec2ssh needs an instance specifying'
-
     instances = list(args_instances(qs))
     if len(instances) > 1:
-        raise UsageError, "Multiple instances found '%s'" % qs
+        raise UsageError, "%d instances found - ec2ssh only supports a single host" % len(instances)
     inst = instances[0]    
     print 'Instance %s' % inst.id
+    
+    if inst.state == 'stopped':
+        raise UsageError, "Instance is stopped - please 'ec2start', then 'ec2ssh'"
 
     try:
         if inst.state == 'pending':
@@ -619,9 +955,9 @@ def ec2ssh(self, parameter_s):
 def instance_completer_factory(filters={}):
     def _completer(self, event):
         try:
-            global ctx
+            global iboto
             res = []
-            for i in ctx.instances([]):
+            for i in iboto.instances:
                 res.append(i.id)
                 for k, v in i.tags.iteritems():
                     res.append('%s:%s' % (k, v))
@@ -644,12 +980,9 @@ def _define_ec2cmd(ip, cmd, verb, state):
     else:
         filters = []
     
-    def _ec2cmd(self, parameter_s):
-        insts = []
-        for inst in args_instances(parameter_s, filters):
-            getattr(inst, verb)()
-            insts.append(inst)
-        return ' '.join( str(inst.id) for inst in insts )
+    def _ec2cmd(ip, parameter_s):
+        instances = args_instances(parameter_s)
+        return getattr(instances, verb)()
     
     # create function with docstring
     fn = (lambda a,b: _ec2cmd(a,b))
@@ -682,11 +1015,7 @@ def ec2din(self, parameter_s):
       %ec2din [filter ...]
     """
     instances = args_instances(parameter_s)
-    print '%-11s %-8s %-9s %-11s %-13s %-17s %s' % ('instance', 'state', 'type', 'zone', 'ami', 'launch time', 'name')
-    print '='*95
-    for i in instances:
-        d = datetime.datetime.strptime(i.launch_time, '%Y-%m-%dT%H:%M:%S.000Z')
-        print '%-11s %-8s %-9s %-11s %-13s %-17s %s' % (i.id, i.state[0:8], i.instance_type, i.placement, i.image_id, d.strftime('%Y-%m-%d %H:%M'), i.tags.get('Name',''))
+    instances.ls()
 
 ######################################################
 # magic ec2watch
@@ -755,22 +1084,22 @@ def magic_account(ip, parameter_s):
     Usage:\\
      %account <accountname>|all
     """
-    global ctx
+    global iboto
 
     parameter_s = parameter_s.strip()
     if parameter_s == 'all':
-        ctx.select_all()
+        iboto.select_all()
         return
     
-    for a in ctx.accounts:
+    for a in iboto.accounts:
         if parameter_s == a.name:
-            ctx.select_account(parameter_s)
+            iboto.select_account(parameter_s)
             return
         
-    raise UsageError, '%%account should be one of %s' % ', '.join(a.name for a in ctx.accounts)
+    raise UsageError, '%%account should be one of %s' % ', '.join(a.name for a in iboto.accounts)
 
 def account_completers(self, event):
-    return [a.name for a in ctx.accounts]
+    return [a.name for a in iboto.accounts]
 
 ######################################################
 # %region
@@ -784,12 +1113,12 @@ def magic_region(ip, parameter_s):
     Usage:\\
       %region <regionname>
     """
-    global ctx
+    global iboto
     
     regions = set(x for x in parameter_s.split() if x)
     if regions.difference(set(REGIONS)):
         raise UsageError, '%region should be in %s' % ', '.join(regions)
-    ctx.select_regions(regions)
+    iboto.select_regions(regions)
 
 def region_completers(self, event):
     return REGIONS
@@ -842,7 +1171,21 @@ class AttributeFilter(IterableFilter):
     @property
     def type(self):
         return self.attr
+    
+class StateFilter(IterableFilter):
+    def __init__(self, states):
+        self.states = states
         
+    def select(self, i):
+        return i.state in self.states
+        
+    def __str__(self):
+        return ','.join(self.states)
+        
+StateFilter.stopped = StateFilter(['stopped'])
+StateFilter.not_stopped = StateFilter(['running', 'pending'])
+StateFilter.not_terminated = StateFilter(['running', 'pending', 'stopped', 'stopping'])
+
 class TagFilter(IterableFilter):
     def __init__(self, name, value, mode='exact'):
         self.name = name
@@ -882,16 +1225,6 @@ class UnionFilter(Filter):
     def type(self):
         return self.filters[0].type
 
-SIZES = ['m1.small', 'm1.large', 'm1.xlarge', 'c1.medium', 'c1.xlarge', 'm2.xlarge', 'm2.2xlarge', 'm2.4xlarge', 'cc1.4xlarge', 't1.micro']
-STATES = ('running', 'stopped')
-ARCHS = ('i386', 'x86_64')
-
-ATTRIBUTE_FILTERS = {
-    'instance_type': SIZES,
-    'architecture': ARCHS,
-    'state': STATES,
-}
-
 ######################################################
 # %limit
 ######################################################
@@ -908,14 +1241,14 @@ def magic_limit(ip, parameter_s):
       %limit m1.large m1.xlarge
       %limit x86_64
     """
-    global ctx
+    global iboto
     
     if parameter_s == '-':
-        ctx.pop_filter()
+        iboto.pop_filter()
         return
     
     for f in parse_filter_list(parameter_s):
-        ctx.add_filter(f)        
+        iboto.add_filter(f)
         
 re_inst_id = re.compile(r'i-\w+')
 re_tag = re.compile(r'(\w+):(.+)')
@@ -923,8 +1256,8 @@ re_ami = re.compile(r'ami-\w+')
 re_re = re.compile(r'/(.+)/')
 
 def magic_pop(ip, parameter_s):
-    global ctx
-    ctx.pop_filter()
+    global iboto
+    iboto.pop_filter()
 
 def parse_filter(arg):
     if arg == 'latest':
@@ -940,7 +1273,7 @@ def parse_filter(arg):
             return AttributeFilter('id', arg)
         else:
             # partial id
-            return AttributeFilter('instance_id', arg, 'startswith')
+            return AttributeFilter('id', arg, 'startswith')
 
     m = re_ami.match(arg)
     if m:

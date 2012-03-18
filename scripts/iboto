@@ -33,25 +33,31 @@ except:
 banner = """iboto ready
 
 Commands available:
+%ec2din  (aka ls)
+%limit   (aka .)
+%pop     (cd cd aka ..)
 %ec2ssh
 %ec2run
 %ec2start
 %ec2stop
 %ec2kill
-%ec2din
 %ec2watch
 %account
 %region
-%limit   (aka .)
-%pop
 
 '%command?' for more information.
 """
 
-cfg = Config()
+import os
+from IPython.config.loader import PyFileConfigLoader
+from IPython.frontend.terminal.ipapp import load_default_config
+
+os.environ['IPYTHON_DIR'] = os.path.join(os.getenv('HOME'), '.iboto')
+
+cfg = load_default_config()
 cfg.TerminalInteractiveShell.confirm_exit = False # turn off annoyance
-cfg.PromptManager.in_template = '{ctx}\n[\#]: '
-cfg.PromptManager.in_template
+cfg.PromptManager.in_template = '{iboto}\n[\#]: '
+cfg.InteractiveShell.autocall = 2
 
 ipshell = InteractiveShellEmbed(
     config = cfg,
