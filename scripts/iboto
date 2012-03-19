@@ -35,7 +35,7 @@ banner = """iboto ready
 Commands available:
 %ec2din  (aka ls)
 %limit   (aka .)
-%pop     (cd cd aka ..)
+%pop     (aka ..)
 %ec2ssh
 %ec2run
 %ec2start
