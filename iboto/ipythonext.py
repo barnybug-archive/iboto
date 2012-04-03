@@ -59,7 +59,7 @@ def load_ipython_extension(ipython):
 ######################################################
 
 ARCHS = ('i386', 'x86_64')
-SIZES = ['m1.small', 'm1.large', 'm1.xlarge', 'c1.medium', 'c1.xlarge', 'm2.xlarge', 'm2.2xlarge', 'm2.4xlarge', 'cc1.4xlarge', 't1.micro']
+SIZES = ['m1.small', 'm1.medium', 'm1.large', 'm1.xlarge', 'c1.medium', 'c1.xlarge', 'm2.xlarge', 'm2.2xlarge', 'm2.4xlarge', 'cc1.4xlarge', 't1.micro']
 SIZE_ARCHS = dict( (s, ARCHS) for s in SIZES )
 for i in ('m1.large', 'm1.xlarge', 'c1.xlarge', 'm2.xlarge', 'm2.2xlarge', 'm2.4xlarge', 'cc1.4xlarge'):
     SIZE_ARCHS[i] = ('x86_64',)
@@ -809,9 +809,9 @@ class EC2RunParameters(Parameters):
         Option(['--disable-api-termination'], action='store_true', default=Option.missing, help='Indicates that the instance(s) may not be terminated using the TerminateInstances API call.'),
         Option(['--instance-initiated-shutdown-behavior'], default=Option.missing, metavar='BEHAVIOR', help='Indicates what the instance(s) should do if an on instance shutdown is issued.'),
         Option(['--arch'], default='x86_64', dest='arch', prompt=True, metavar='ARCH', choices=context.archs, help='Which architecture to launch.'),
-        Option(['--ebs'], default='x86_64', dest='ebs', prompt=True, metavar='EBS', choices=context.ebss, help='EBS or not.'),
+        Option(['--ebs'], default='yes', dest='ebs', prompt=True, metavar='EBS', choices=context.ebss, help='EBS or not.'),
         Option(['--ami'], dest='ami', prompt=True, metavar='AMI', choices=context.amis, help='AMI to launch'),
-        Option(['-T', '--tags'], metavar='TAG', action='append', help='Add a tag to the launched instance.'),
+        Option(['-T', '--tags'], metavar='TAG', action='append', default=Option.missing, help='Add a tag to the launched instance.'),
     ]
         
 class CustomOptionParser(optparse.OptionParser):
@@ -845,14 +845,18 @@ def ec2run(self, parameter_s):
     arch = run_args.pop('arch')
     ebs = run_args.pop('ebs')
     aminame = run_args.pop('ami')
-    tags = run_args.pop('tags')
+    tags = run_args.pop('tags', None)
     run_args['image_id'] = resolve_ami(region, aminame, {'arch': arch, 'store': (ebs == 'yes' and 'ebs' or 'instance')})
     r = connection.ec2.run_instances(**run_args)
     
-    for tag in tags:
-        for i in allinstances([r]):
-            key, value = tag.split(':')
-            i.add_tag(key, value)
+    if tags:
+        for tag in tags:
+            if ':' in tag:
+                for i in allinstances([r]):
+                    key, value = tag.split(':', 1)
+                    i.add_tag(key, value)
+            else:
+                print 'Ignoring tag %s' % tag
     
     inst = firstinstance([r])
     iboto.add_filter(AttributeFilter('id', inst.id))
