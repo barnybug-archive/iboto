@@ -663,7 +663,10 @@ class Parameters(object):
                 else:
                     c = op.choices(run_args)
                     if c and len(c) == 1:
-                        run_args[op.dest] = c[0]
+                        if op.action == 'append':
+                            run_args[op.dest] = [c[0]]
+                        else:
+                            run_args[op.dest] = c[0]
                         print '%s: %s' % (op.title, c[0])
                     else:
                         ret = self._prompt(op, run_args[op.dest], run_args, c)
@@ -712,6 +715,7 @@ class Option(object):
         self._choices = choices
         self.prompt = prompt
         self.default = default
+        self.action = action
         self.op = optparse.Option(*opts, dest=dest, help=self.help, metavar=self.metavar, action=action)
         self.dest = self.op.dest
         self.title = title or self.dest
@@ -846,6 +850,7 @@ def ec2run(self, parameter_s):
     ebs = run_args.pop('ebs')
     aminame = run_args.pop('ami')
     tags = run_args.pop('tags', None)
+        
     run_args['image_id'] = resolve_ami(region, aminame, {'arch': arch, 'store': (ebs == 'yes' and 'ebs' or 'instance')})
     r = connection.ec2.run_instances(**run_args)
     
