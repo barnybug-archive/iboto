@@ -52,7 +52,7 @@ import os
 from IPython.config.loader import PyFileConfigLoader
 from IPython.frontend.terminal.ipapp import load_default_config
 
-os.environ['IPYTHON_DIR'] = os.path.join(os.getenv('HOME'), '.iboto')
+os.environ['IPYTHONDIR'] = os.path.join(os.getenv('HOME'), '.iboto')
 
 cfg = load_default_config()
 cfg.TerminalInteractiveShell.confirm_exit = False # turn off annoyance
